@@ -1,0 +1,30 @@
+CompileFlags:
+  Add:
+    - -xc
+    - -std=c11
+    - -IW:/Code/amiga/antigravity/docs/sdk/include/include_h
+    - -IW:/Code/amiga/antigravity/projects/AmigaNVMeDevice/include
+    - -D__GNUC__=11
+    - -D__GNUC_MINOR__=0
+    - -D__amigaos4__
+    - -D__PPC__
+    - -Wno-unknown-attributes
+    - -Wno-ignored-pragmas
+    - -Wno-incompatible-library-redeclaration
+    - -Wno-pointer-sign
+    - -Wno-int-conversion
+    - -Wno-incompatible-pointer-types
+    - -Wno-pointer-to-int-cast
+    - -Wno-int-to-pointer-cast
+    - -Wno-implicit-function-declaration
+    - -Wno-non-literal-null-conversion
+    - -Wno-implicit-int-conversion
+    - -ferror-limit=200
+
+Diagnostics:
+  Suppress:
+    - pp_file_not_found
+    - typecheck_call_too_few_args
+    - typecheck_call_too_few_args_at_least
+    - typecheck_call_too_many_args
+  UnusedIncludes: None
