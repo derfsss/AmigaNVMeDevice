@@ -1,15 +1,15 @@
-# NVMe Boot Strategy for AmigaOS 4.1 on QEMU AmigaOne
+# NVMe Boot Strategy for AmigaOS 4.1 on QEMU Pegasos2
 
 ## Overview
 
-QEMU supports attaching NVMe drives (`-device nvme`) but the AmigaOne's
+QEMU supports attaching NVMe drives (`-device nvme`) but the Pegasos2's
 bboot firmware has no disk drivers and cannot boot directly from NVMe.
 This document describes the workaround using `nvme.device` as a Kickstart
-module, a future U-Boot path, and the QEMU command line to use.
+module and the QEMU command line to use.
 
 ---
 
-## How AmigaOS Boots on QEMU AmigaOne
+## How AmigaOS Boots on QEMU Pegasos2
 
 1. QEMU loads `bboot` as the kernel (`-kernel bboot`)
 2. bboot loads Kickstart from a QEMU loader device: `-device loader,addr=0x600000,file=kickstart.zip`
@@ -29,75 +29,74 @@ with the driver exists.
 ### Step 1 — Build nvme.device
 
 ```sh
-cd /mnt/w/Code/amiga/antigravity/projects/AmigaNVMeDevice
-docker run --rm -v /mnt/w/Code/amiga/antigravity:/src -w /src/projects/AmigaNVMeDevice \
-    walkero/amigagccondocker:os4-gcc11 \
-    make -j$(nproc) clean all
+# From WSL2 (two separate docker calls):
+wsl sh -c "docker run --rm -v /mnt/w/Code/amiga/antigravity:/src -w /src/projects/AmigaNVMeDevice walkero/amigagccondocker:os4-gcc11 make clean"
+wsl sh -c "docker run --rm -v /mnt/w/Code/amiga/antigravity:/src -w /src/projects/AmigaNVMeDevice walkero/amigagccondocker:os4-gcc11 make -j\$(nproc) all"
 ```
 
 Output: `build/nvme.device`
 
 ### Step 2 — Add nvme.device to kickstart.zip
 
-Unpack your existing `kickstart.zip`, add `nvme.device` to the `Kickstart/`
-folder, and repack:
+Use the PowerShell update script to replace the driver in the Pegasos2 kickstart.zip:
 
-```sh
-# Unpack
-mkdir kickstart_tmp
-cd kickstart_tmp
-unzip ../kickstart.zip
-
-# Add driver (copy into Kickstart folder alongside other modules)
-cp /mnt/w/Code/amiga/antigravity/projects/AmigaNVMeDevice/build/nvme.device Kickstart/
-
-# Edit Kickstart/kicklayout if needed to reference nvme.device
-# (if kicklayout lists modules explicitly; otherwise all files in Kickstart/ are loaded)
-
-# Repack
-zip -r ../kickstart_new.zip .
-cd ..
+```powershell
+# From Windows (after copying build/nvme.device to S:\temp\):
+powershell -File S:\temp\update_peg2_zip.ps1
 ```
 
-### Step 3 — Create NVMe disk image and install AmigaOS
+Or manually: unpack kickstart.zip, add `nvme.device` to the `Kickstart/`
+folder, add an entry to `Kickstart/kicklayout`, and repack.
+
+### Step 3 — Create NVMe disk image
 
 ```sh
-# Create a blank NVMe disk image (e.g. 10 GB)
-qemu-img create -f raw amigaos_nvme.img 10G
+# Create a blank NVMe disk image (e.g. 256 MB for testing)
+qemu-img create -f raw nvme_test.img 256M
 ```
 
-Boot AmigaOS with both a temporary install source (e.g. existing VirtIO SCSI)
-and the blank NVMe image attached. Use AmigaOS Installer to install onto the
-NVMe drive (it will appear as `DH0:` or `NVMe0:` once nvme.device is loaded).
+### Step 4 — Create diskboot.config
 
-### Step 4 — QEMU command line for NVMe boot
+`diskboot.kmod` must be told about nvme.device. Create a file `diskboot.config`
+with the following entry appended:
+
+```
+nvme.device 1 1
+```
+
+Format: `devicename maxunits flags` (1=HD, 2=CD, 3=both).
+
+Place this file where AmigaOS can find it at boot (e.g. `Devs/diskboot.config`
+on the SYS: volume, or in an accessible VVFAT share for testing).
+
+### Step 5 — QEMU command line for NVMe boot
+
+**Critical**: A VirtIO SCSI device MUST be present in the QEMU config, even if
+it has no drives attached. `diskboot.kmod` only activates its partition scan
+pipeline when it detects a VirtIO SCSI controller. Without one, nvme.device is
+ignored even if listed in diskboot.config.
 
 ```sh
-qemu-system-ppc -M amigaone \
+qemu-system-ppc -M pegasos2 \
     -kernel bboot \
-    -device loader,addr=0x600000,file=kickstart_new.zip \
+    -device loader,addr=0x600000,file=kickstart.zip \
+    -device virtio-scsi-pci,id=scsi0 \
     -device nvme,drive=nvme0,serial=amiga-nvme-0 \
-    -drive file=amigaos_nvme.img,if=none,id=nvme0,format=raw \
+    -drive file=nvme_test.img,if=none,id=nvme0,format=raw \
     -m 512 \
     -serial stdio
 ```
 
 Notes:
+- The `-device virtio-scsi-pci` is required even with no SCSI drives — it triggers diskboot
 - No separate small boot drive is needed — kickstart.zip is loaded from RAM
 - The NVMe drive holds SYS: (the full AmigaOS installation)
 - `serial=amiga-nvme-0` sets the NVMe controller serial number (visible in Identify Controller)
 - Multiple NVMe drives can be attached: add another `-device nvme,...` + `-drive ...`
+- For testing, add a VVFAT share with diskboot.config:
+  `-drive file=fat:rw:S:/temp/,format=vvfat,if=none,id=vvfat -device virtio-blk-pci,drive=vvfat`
 
-### Multiple NVMe namespaces
-
-QEMU's nvme device supports multiple namespaces per controller:
-
-```sh
--device nvme,drive=nvme0,serial=amiga-nvme-0,num_queues=8 \
--drive file=disk0.img,if=none,id=nvme0,format=raw
-```
-
-To add multiple NVMe controllers:
+### Multiple NVMe controllers
 
 ```sh
 -device nvme,drive=nvme0,serial=nvme-0 \
@@ -111,50 +110,20 @@ supported as multiple devices in the AmigaOS device list.
 
 ---
 
-## How This Mirrors the Pegasos2 FFS→SFS Pattern
+## Platform Notes
 
-On real Pegasos2 hardware, SmartFirmware boots from a small FFS partition
-that contains only the firmware loader. The loader then mounts a larger SFS
-partition that has the full AmigaOS installation.
+### Pegasos2 (MV64361) — supported
 
-The QEMU AmigaOne NVMe setup is analogous:
-- **Small boot medium**: bboot + kickstart.zip loaded directly by QEMU (in RAM)
-- **Large OS drive**: NVMe image containing SYS:
+The Pegasos2's MV64361 PCI bridge transparently forwards CPU memory cycles
+to PCI devices. NVMe BAR0 is memory-mapped at addresses like `0x84200000`.
+Register access uses `lwbrx`/`stwbrx` PPC inline asm for LE↔BE byte swap.
 
-No physical small boot disk is needed in the QEMU case because bboot receives
-kickstart.zip as a QEMU `-device loader` payload, not from disk.
+### AmigaOne (Articia-S) — NOT supported
 
----
-
-## Future: True NVMe Boot via U-Boot
-
-For booting a real AmigaOne from NVMe (or simulating this in QEMU), a
-firmware update is needed.
-
-### What U-Boot NVMe support requires
-
-U-Boot has NVMe support via `CONFIG_NVME`, `CONFIG_NVME_PCI`, `CONFIG_CMD_NVME`
-(see `drivers/nvme/` in U-Boot source). Commands: `nvme scan`, `nvme info`,
-`nvme read addr blk cnt`.
-
-### QEMU AmigaOne machine and U-Boot
-
-The QEMU AmigaOne machine (`hw/ppc/amigaone.c`) supports an optional U-Boot ROM:
-
-```sh
-qemu-system-ppc -M amigaone -bios u-boot-amigaone.bin ...
-```
-
-To add NVMe boot support to this path:
-1. Build U-Boot for PowerPC with NVMe enabled
-2. Add an NVMe boot command to the U-Boot boot script
-3. U-Boot loads bboot and kickstart.zip from the NVMe drive
-4. bboot starts Kickstart (which includes nvme.device)
-
-This would allow booting a real AmigaOne from NVMe without the `-kernel bboot`
-workaround, but requires building and testing a custom U-Boot binary.
-
-**Status: documented, not implemented in this project.**
+The AmigaOne's Articia-S PCI bridge does not forward MMIO cycles to PCI
+devices. All MMIO access methods (volatile pointer, InByte/InLong, lwbrx/stwbrx,
+IMMU->RemapMemory) have been tested and confirmed to fail. NVMe requires MMIO
+for register access, so the AmigaOne cannot support NVMe.
 
 ---
 
@@ -171,5 +140,12 @@ workaround, but requires building and testing a custom U-Boot binary.
 
 **Filesystem not mounting:**
 - Check that mounter.library announce is implemented in unit_discovery.c
+- Ensure `diskboot.config` contains `nvme.device 1 1`
+- Ensure a VirtIO SCSI device is present in QEMU config (diskboot.kmod requirement)
 - Add explicit `MountList` entry for the NVMe unit if auto-mount fails
 - Use `Info` command from AmigaOS shell to list mounted drives
+
+**NVMe drive appears but shows wrong size:**
+- Check that `NSCMD_TD_GETGEOMETRY64` fills `struct DriveGeometry64` (from
+  `<libraries/mounter.h>`), NOT `struct DriveGeometry` (from `<devices/trackdisk.h>`)
+- These are completely different structs with different field layouts

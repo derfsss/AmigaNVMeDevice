@@ -1,10 +1,27 @@
 #ifndef NVME_VERSION_H
 #define NVME_VERSION_H
 
-#define DEVNAME         "nvme.device"
-#define DEVVER          1
-#define DEVREV          0
-#define DEVVERSIONSTRING "nvme.device 1.0 (2026-03-04)"
-#define VERSION_LOG_STRING "1.0"
+/*
+ * version.h — identification strings for nvme.device.
+ *
+ * BUILD_DATE and BUILD_TIME are injected by the Makefile on every build
+ * so they always reflect the actual compile wall-clock time, never the
+ * stale __DATE__ / __TIME__ of a cached translation unit.  If compiled
+ * outside the Makefile, they fall back to literal "unknown".
+ */
+
+#define DEVNAME            "nvme.device"
+#define DEVVER             1
+#define DEVREV             61
+#define DEVVERSIONSTRING   "nvme.device 1.61 (2026-04-12)"
+#define VERSION_LOG_STRING "1.61"
+
+#ifndef BUILD_DATE
+#define BUILD_DATE "unknown"
+#endif
+
+#ifndef BUILD_TIME
+#define BUILD_TIME "unknown"
+#endif
 
 #endif /* NVME_VERSION_H */

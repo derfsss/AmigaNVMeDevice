@@ -1,0 +1,9 @@
+; diskboot.config entry for nvme.device boot-drive integration.
+;
+; Append this line to Kickstart:diskboot.config (or to the
+; diskboot.config inside your kickstart.zip on QEMU) so that the
+; diskboot.kmod module scans the NVMe controller for mountable
+; partitions at boot time.
+;
+;    <device name>      <unit>  <flags>
+nvme.device              1        1

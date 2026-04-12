@@ -1,219 +1,299 @@
+/*
+ * nvme_init.c — per-controller reset / enable / admin-queue bring-up.
+ *
+ * Sequence (NVMe 1.4 §3.5.1), applied independently to each controller:
+ *
+ *   1. Read CAP — extract MQES, DSTRD, MPSMIN
+ *   2. Disable (CC.EN=0), wait CSTS.RDY=0
+ *   3. Allocate admin SQ + CQ (MEMF_SHARED), DMA-map, write ASQ/ACQ/AQA
+ *   4. Program CC (page size, entry sizes) and set CC.EN=1
+ *   5. Wait CSTS.RDY=1
+ *   6. Allocate the 4 KiB Identify scratch buffer
+ *   7. Admin Identify Controller — populate MDTS / model / FW
+ *
+ * Namespace enumeration and per-unit I/O queue creation happen later
+ * in unit_discovery.c on a per-controller basis.
+ */
+
 #include "nvme_init.h"
 #include "nvme_admin.h"
 #include "nvme_device.h"
 #include <exec/exec.h>
 #include <exec/memory.h>
 
-/*
- * nvme_init.c — NVMe controller reset and initialisation sequence.
- *
- * Sequence (NVMe spec section 3.5.1):
- *   1. Read CAP — extract MQES, DSTRD, MPSMIN
- *   2. Disable controller (CC.EN=0), poll CSTS.RDY=0
- *   3. Allocate admin SQ + CQ (MEMF_SHARED), DMA-map them, write ASQ/ACQ/AQA
- *   4. Set CC (enable, page size, SQ/CQ entry sizes), write CC.EN=1
- *   5. Poll CSTS.RDY=1
- *   6. Allocate identify scratch buffer
- *   7. Admin: Identify Controller — extract model, MDTS
- *   (Namespace discovery and I/O queue creation done in unit_discovery.c)
- */
-
-/* Busy-poll CSTS.RDY with ~5s timeout (iterations at ~1µs each on fast PPC) */
+/* Busy-poll CSTS.RDY with ~5 s timeout (iterations at ~1µs each on fast PPC) */
 #define NVME_READY_POLL_ITERS  5000000UL
 
-BOOL InitNVMe(struct NVMeBase *devBase)
+BOOL InitNVMe(struct NVMeController *ctrl)
 {
-    struct ExecIFace *IExec  = devBase->IExec;
-    struct PCIDevice *pciDev = devBase->pciDevice;
-    ULONG             base   = devBase->iobase;
+    struct NVMeBase  *devBase = ctrl->dev_base;
+    struct ExecIFace *IExec   = devBase->IExec;
+    ULONG             base    = ctrl->iobase;
 
-    /* 1. Read CAP */
-    ULONG cap_lo = NVME_R32(base, pciDev, NVME_REG_CAP_LO);
-    ULONG cap_hi = NVME_R32(base, pciDev, NVME_REG_CAP_HI);
+    BOOL have_sq_vec = FALSE;
+    BOOL have_cq_vec = FALSE;
+    BOOL have_sq_dma = FALSE;
+    BOOL have_cq_dma = FALSE;
+    BOOL have_id_vec = FALSE;
+    BOOL have_id_dma = FALSE;
 
-    devBase->cap_mqes  = NVME_CAP_MQES(cap_lo) + 1; /* spec value is max-1 */
-    devBase->cap_dstrd = NVME_CAP_DSTRD(cap_lo);    /* doorbell stride exponent */
-
-    /* Host page size: 4KB minimum (log2(4096)-12 = 0) */
-    ULONG mpsmin = NVME_CAP_MPSMIN_HI(cap_hi);
-    devBase->page_size = 4096u << mpsmin;
-
-    IExec->DebugPrintF("[nvme.device:init] CAP: MQES=%lu DSTRD=%lu MPSMIN=%lu page_size=%lu\n",
-                       devBase->cap_mqes, devBase->cap_dstrd, mpsmin, devBase->page_size);
-
-    /* 2. Disable controller */
-    ULONG cc = NVME_R32(base, pciDev, NVME_REG_CC);
-    if (cc & NVME_CC_EN) {
-        NVME_W32(base, pciDev, NVME_REG_CC, cc & ~NVME_CC_EN);
-        /* Poll CSTS.RDY=0 */
-        for (ULONG i = 0; i < NVME_READY_POLL_ITERS; i++) {
-            if (!(NVME_R32(base, pciDev, NVME_REG_CSTS) & NVME_CSTS_RDY))
-                goto disabled;
-        }
-        IExec->DebugPrintF("[nvme.device:init] Timeout waiting for controller to disable\n");
-        return FALSE;
-    }
-disabled:
-
-    /* 3. Allocate admin queues */
     ULONG sq_bytes = NVME_ADMIN_QUEUE_DEPTH * NVME_SQE_SIZE;
     ULONG cq_bytes = NVME_ADMIN_QUEUE_DEPTH * NVME_CQE_SIZE;
 
-    devBase->admin_sq = IExec->AllocVecTags(sq_bytes,
-        AVT_Type,       MEMF_SHARED,
-        AVT_Alignment,  devBase->page_size,
-        AVT_Clear,      0,
-        TAG_DONE);
-    devBase->admin_cq = IExec->AllocVecTags(cq_bytes,
-        AVT_Type,       MEMF_SHARED,
-        AVT_Alignment,  devBase->page_size,
-        AVT_Clear,      0,
-        TAG_DONE);
-    if (!devBase->admin_sq || !devBase->admin_cq) {
-        IExec->DebugPrintF("[nvme.device:init] Failed to allocate admin queues\n");
-        goto fail_queues;
+    /* 1. Read CAP. */
+    ULONG cap_lo = NVME_R32(base, NULL, NVME_REG_CAP_LO);
+    ULONG cap_hi = NVME_R32(base, NULL, NVME_REG_CAP_HI);
+
+    ctrl->cap_mqes  = NVME_CAP_MQES(cap_lo) + 1;
+    ctrl->cap_dstrd = NVME_CAP_DSTRD(cap_lo);
+
+    ULONG mpsmin = NVME_CAP_MPSMIN_HI(cap_hi);
+    ctrl->page_size = 4096u << mpsmin;
+
+    DLOG(IExec, "[nvme.device:init] ctrl %lu CAP: MQES=%lu DSTRD=%lu"
+                " MPSMIN=%lu page_size=%lu\n",
+         ctrl->ctrl_idx, ctrl->cap_mqes, ctrl->cap_dstrd, mpsmin, ctrl->page_size);
+
+    /* 2. Disable controller, wait CSTS.RDY=0. */
+    ULONG cc = NVME_R32(base, NULL, NVME_REG_CC);
+    if (cc & NVME_CC_EN) {
+        NVME_W32(base, NULL, NVME_REG_CC, cc & ~NVME_CC_EN);
+        ULONG i;
+        for (i = 0; i < NVME_READY_POLL_ITERS; i++) {
+            if (!(NVME_R32(base, NULL, NVME_REG_CSTS) & NVME_CSTS_RDY))
+                break;
+        }
+        if (i == NVME_READY_POLL_ITERS) {
+            DLOG(IExec, "[nvme.device:init] ctrl %lu: CSTS.RDY=0 timeout\n",
+                 ctrl->ctrl_idx);
+            goto err;
+        }
     }
 
-    /* DMA-map admin queues */
-    ULONG sq_dma_entries = IExec->StartDMA(devBase->admin_sq, sq_bytes, DMA_ReadFromRAM);
-    devBase->admin_sq_dma = IExec->AllocSysObjectTags(ASOT_DMAENTRY,
-        ASODMAE_NumEntries, sq_dma_entries, TAG_DONE);
-    if (!devBase->admin_sq_dma) goto fail_dma;
-    IExec->GetDMAList(devBase->admin_sq, sq_bytes, DMA_ReadFromRAM, devBase->admin_sq_dma);
-    devBase->admin_sq_phys = (ULONG)devBase->admin_sq_dma[0].PhysicalAddress;
+    /* 3. Allocate admin SQ + CQ. */
+    ctrl->admin_sq = IExec->AllocVecTags(sq_bytes,
+        AVT_Type,           MEMF_SHARED,
+        AVT_Alignment,      ctrl->page_size,
+        AVT_ClearWithValue, 0,
+        TAG_DONE);
+    if (!ctrl->admin_sq) {
+        DLOG(IExec, "[nvme.device:init] ctrl %lu: admin SQ alloc failed\n",
+             ctrl->ctrl_idx);
+        goto err;
+    }
+    NVME_LEAK_INC(nvme_leak_vec);
+    have_sq_vec = TRUE;
 
-    ULONG cq_dma_entries = IExec->StartDMA(devBase->admin_cq, cq_bytes, DMA_ReadFromRAM);
-    devBase->admin_cq_dma = IExec->AllocSysObjectTags(ASOT_DMAENTRY,
-        ASODMAE_NumEntries, cq_dma_entries, TAG_DONE);
-    if (!devBase->admin_cq_dma) goto fail_dma;
-    IExec->GetDMAList(devBase->admin_cq, cq_bytes, DMA_ReadFromRAM, devBase->admin_cq_dma);
-    devBase->admin_cq_phys = (ULONG)devBase->admin_cq_dma[0].PhysicalAddress;
+    ctrl->admin_cq = IExec->AllocVecTags(cq_bytes,
+        AVT_Type,           MEMF_SHARED,
+        AVT_Alignment,      ctrl->page_size,
+        AVT_ClearWithValue, 0,
+        TAG_DONE);
+    if (!ctrl->admin_cq) {
+        DLOG(IExec, "[nvme.device:init] ctrl %lu: admin CQ alloc failed\n",
+             ctrl->ctrl_idx);
+        goto err;
+    }
+    NVME_LEAK_INC(nvme_leak_vec);
+    have_cq_vec = TRUE;
 
-    devBase->admin_sq_tail = 0;
-    devBase->admin_cq_head = 0;
-    devBase->admin_cq_phase = 1; /* phase starts at 1 */
-    devBase->next_cmd_id   = 1;
+    /* DMA-map admin SQ. */
+    ULONG sq_entries = IExec->StartDMA(ctrl->admin_sq, sq_bytes, DMA_ReadFromRAM);
+    have_sq_dma = TRUE;
+    NVME_LEAK_INC(nvme_leak_dma);
+    if (sq_entries == 0) goto err;
+    ctrl->admin_sq_dma = IExec->AllocSysObjectTags(ASOT_DMAENTRY,
+        ASODMAE_NumEntries, sq_entries, TAG_DONE);
+    if (!ctrl->admin_sq_dma) goto err;
+    NVME_LEAK_INC(nvme_leak_dmaentry);
+    IExec->GetDMAList(ctrl->admin_sq, sq_bytes, DMA_ReadFromRAM, ctrl->admin_sq_dma);
+    ctrl->admin_sq_phys = (ULONG)ctrl->admin_sq_dma[0].PhysicalAddress;
 
-    /* Write ASQ / ACQ base addresses (64-bit — high word 0 on 32-bit PPC DMA) */
-    NVME_W32(base, pciDev, NVME_REG_ASQ_LO, devBase->admin_sq_phys);
-    NVME_W32(base, pciDev, NVME_REG_ASQ_HI, 0);
-    NVME_W32(base, pciDev, NVME_REG_ACQ_LO, devBase->admin_cq_phys);
-    NVME_W32(base, pciDev, NVME_REG_ACQ_HI, 0);
+    /* DMA-map admin CQ. */
+    ULONG cq_entries = IExec->StartDMA(ctrl->admin_cq, cq_bytes, 0);
+    have_cq_dma = TRUE;
+    NVME_LEAK_INC(nvme_leak_dma);
+    if (cq_entries == 0) goto err;
+    ctrl->admin_cq_dma = IExec->AllocSysObjectTags(ASOT_DMAENTRY,
+        ASODMAE_NumEntries, cq_entries, TAG_DONE);
+    if (!ctrl->admin_cq_dma) goto err;
+    NVME_LEAK_INC(nvme_leak_dmaentry);
+    IExec->GetDMAList(ctrl->admin_cq, cq_bytes, 0, ctrl->admin_cq_dma);
+    ctrl->admin_cq_phys = (ULONG)ctrl->admin_cq_dma[0].PhysicalAddress;
 
-    /* Admin Queue Attributes: ASQS and ACQS (size-1) */
-    NVME_W32(base, pciDev, NVME_REG_AQA,
+    ctrl->admin_sq_tail  = 0;
+    ctrl->admin_cq_head  = 0;
+    ctrl->admin_cq_phase = 1;
+    ctrl->next_cmd_id    = 1;
+
+    /* Program ASQ / ACQ / AQA. */
+    NVME_W32(base, NULL, NVME_REG_ASQ_LO, ctrl->admin_sq_phys);
+    NVME_W32(base, NULL, NVME_REG_ASQ_HI, 0);
+    NVME_W32(base, NULL, NVME_REG_ACQ_LO, ctrl->admin_cq_phys);
+    NVME_W32(base, NULL, NVME_REG_ACQ_HI, 0);
+    NVME_W32(base, NULL, NVME_REG_AQA,
              NVME_AQA_ASQS(NVME_ADMIN_QUEUE_DEPTH) |
              NVME_AQA_ACQS(NVME_ADMIN_QUEUE_DEPTH));
 
-    /* 4. Configure and enable controller */
-    ULONG new_cc = NVME_CC_DEFAULT | NVME_CC_EN;
-    NVME_W32(base, pciDev, NVME_REG_CC, new_cc);
+    /* 4. Enable controller. */
+    NVME_W32(base, NULL, NVME_REG_CC, NVME_CC_DEFAULT | NVME_CC_EN);
 
-    /* 5. Poll CSTS.RDY=1 */
-    for (ULONG i = 0; i < NVME_READY_POLL_ITERS; i++) {
-        ULONG csts = NVME_R32(base, pciDev, NVME_REG_CSTS);
-        if (csts & NVME_CSTS_CFS) {
-            IExec->DebugPrintF("[nvme.device:init] Controller Fatal Status during enable\n");
-            goto fail_dma;
+    /* 5. Wait CSTS.RDY=1; abort on CFS. */
+    {
+        ULONG i;
+        for (i = 0; i < NVME_READY_POLL_ITERS; i++) {
+            ULONG csts = NVME_R32(base, NULL, NVME_REG_CSTS);
+            if (csts & NVME_CSTS_CFS) {
+                DLOG(IExec, "[nvme.device:init] ctrl %lu: CSTS.CFS during enable\n",
+                     ctrl->ctrl_idx);
+                goto err;
+            }
+            if (csts & NVME_CSTS_RDY) break;
         }
-        if (csts & NVME_CSTS_RDY)
-            goto ready;
+        if (i == NVME_READY_POLL_ITERS) {
+            DLOG(IExec, "[nvme.device:init] ctrl %lu: CSTS.RDY=1 timeout\n",
+                 ctrl->ctrl_idx);
+            goto err;
+        }
     }
-    IExec->DebugPrintF("[nvme.device:init] Timeout waiting for controller ready\n");
-    goto fail_dma;
 
-ready:
-    IExec->DebugPrintF("[nvme.device:init] Controller ready. VS=0x%08lx\n",
-                       NVME_R32(base, pciDev, NVME_REG_VS));
+    DLOG(IExec, "[nvme.device:init] ctrl %lu ready — VS=0x%08lx\n",
+         ctrl->ctrl_idx, NVME_R32(base, NULL, NVME_REG_VS));
 
-    /* 6. Allocate 4KB identify scratch buffer */
-    devBase->identify_buf = IExec->AllocVecTags(4096,
-        AVT_Type,      MEMF_SHARED,
-        AVT_Alignment, devBase->page_size,
-        AVT_Clear,     0,
+    /* Mask admin interrupt until all unit tasks are up. */
+    NVME_W32(base, NULL, NVME_REG_INTMS, 0xFFFFFFFF);
+
+    /* 6. Identify scratch buffer. */
+    ctrl->identify_buf = IExec->AllocVecTags(4096,
+        AVT_Type,           MEMF_SHARED,
+        AVT_Alignment,      ctrl->page_size,
+        AVT_ClearWithValue, 0,
         TAG_DONE);
-    if (!devBase->identify_buf) {
-        IExec->DebugPrintF("[nvme.device:init] Failed to allocate identify buffer\n");
-        goto fail_dma;
-    }
-    ULONG id_dma_entries = IExec->StartDMA(devBase->identify_buf, 4096, DMA_ReadFromRAM);
-    devBase->identify_dma = IExec->AllocSysObjectTags(ASOT_DMAENTRY,
-        ASODMAE_NumEntries, id_dma_entries, TAG_DONE);
-    if (!devBase->identify_dma) goto fail_identify;
-    IExec->GetDMAList(devBase->identify_buf, 4096, DMA_ReadFromRAM, devBase->identify_dma);
-    devBase->identify_phys = (ULONG)devBase->identify_dma[0].PhysicalAddress;
+    if (!ctrl->identify_buf) goto err;
+    NVME_LEAK_INC(nvme_leak_vec);
+    have_id_vec = TRUE;
 
-    /* 7. Identify Controller */
-    if (!NVMe_IdentifyController(devBase)) {
-        IExec->DebugPrintF("[nvme.device:init] Identify Controller failed\n");
-        goto fail_identify;
-    }
+    ULONG id_entries = IExec->StartDMA(ctrl->identify_buf, 4096, 0);
+    have_id_dma = TRUE;
+    NVME_LEAK_INC(nvme_leak_dma);
+    if (id_entries == 0) goto err;
+    ctrl->identify_dma = IExec->AllocSysObjectTags(ASOT_DMAENTRY,
+        ASODMAE_NumEntries, id_entries, TAG_DONE);
+    if (!ctrl->identify_dma) goto err;
+    NVME_LEAK_INC(nvme_leak_dmaentry);
+    IExec->GetDMAList(ctrl->identify_buf, 4096, 0, ctrl->identify_dma);
+    ctrl->identify_phys = (ULONG)ctrl->identify_dma[0].PhysicalAddress;
+
+    /* 7. Identify Controller. */
+    if (!NVMe_IdentifyController(ctrl))
+        goto err;
 
     return TRUE;
 
-fail_identify:
-    if (devBase->identify_buf) {
-        IExec->EndDMA(devBase->identify_buf, 4096, DMA_ReadFromRAM);
-        IExec->FreeVec(devBase->identify_buf);
-        devBase->identify_buf = NULL;
+err:
+    if (ctrl->identify_dma) {
+        IExec->FreeSysObject(ASOT_DMAENTRY, ctrl->identify_dma);
+        NVME_LEAK_DEC(nvme_leak_dmaentry);
+        ctrl->identify_dma = NULL;
     }
-fail_dma:
-    if (devBase->admin_sq_dma) {
-        IExec->EndDMA(devBase->admin_sq, sq_bytes, DMA_ReadFromRAM);
-        IExec->FreeSysObject(ASOT_DMAENTRY, devBase->admin_sq_dma);
-        devBase->admin_sq_dma = NULL;
+    if (have_id_dma) {
+        IExec->EndDMA(ctrl->identify_buf, 4096, 0);
+        NVME_LEAK_DEC(nvme_leak_dma);
     }
-    if (devBase->admin_cq_dma) {
-        IExec->EndDMA(devBase->admin_cq, cq_bytes, DMA_ReadFromRAM);
-        IExec->FreeSysObject(ASOT_DMAENTRY, devBase->admin_cq_dma);
-        devBase->admin_cq_dma = NULL;
+    if (have_id_vec) {
+        IExec->FreeVec(ctrl->identify_buf);
+        NVME_LEAK_DEC(nvme_leak_vec);
+        ctrl->identify_buf = NULL;
     }
-fail_queues:
-    if (devBase->admin_sq) { IExec->FreeVec(devBase->admin_sq); devBase->admin_sq = NULL; }
-    if (devBase->admin_cq) { IExec->FreeVec(devBase->admin_cq); devBase->admin_cq = NULL; }
+    if (ctrl->admin_cq_dma) {
+        IExec->FreeSysObject(ASOT_DMAENTRY, ctrl->admin_cq_dma);
+        NVME_LEAK_DEC(nvme_leak_dmaentry);
+        ctrl->admin_cq_dma = NULL;
+    }
+    if (have_cq_dma) {
+        IExec->EndDMA(ctrl->admin_cq, cq_bytes, 0);
+        NVME_LEAK_DEC(nvme_leak_dma);
+    }
+    if (ctrl->admin_sq_dma) {
+        IExec->FreeSysObject(ASOT_DMAENTRY, ctrl->admin_sq_dma);
+        NVME_LEAK_DEC(nvme_leak_dmaentry);
+        ctrl->admin_sq_dma = NULL;
+    }
+    if (have_sq_dma) {
+        IExec->EndDMA(ctrl->admin_sq, sq_bytes, DMA_ReadFromRAM);
+        NVME_LEAK_DEC(nvme_leak_dma);
+    }
+    if (have_cq_vec) {
+        IExec->FreeVec(ctrl->admin_cq);
+        NVME_LEAK_DEC(nvme_leak_vec);
+        ctrl->admin_cq = NULL;
+    }
+    if (have_sq_vec) {
+        IExec->FreeVec(ctrl->admin_sq);
+        NVME_LEAK_DEC(nvme_leak_vec);
+        ctrl->admin_sq = NULL;
+    }
     return FALSE;
 }
 
-void CleanupNVMe(struct NVMeBase *devBase)
+void CleanupNVMe(struct NVMeController *ctrl)
 {
-    struct ExecIFace *IExec  = devBase->IExec;
-    struct PCIDevice *pciDev = devBase->pciDevice;
-    ULONG             base   = devBase->iobase;
+    struct ExecIFace *IExec = ctrl->dev_base->IExec;
+    ULONG             base  = ctrl->iobase;
 
-    if (!devBase->admin_sq) return; /* not initialised */
+    if (!ctrl->admin_sq) return;   /* never initialised */
 
-    /* Normal shutdown */
-    ULONG cc = NVME_R32(base, pciDev, NVME_REG_CC);
-    NVME_W32(base, pciDev, NVME_REG_CC, (cc & ~(3 << 14)) | NVME_CC_SHN_NORM);
-    /* Poll CSTS.SHST == 2 (shutdown complete) — best effort, no hard timeout */
-    for (ULONG i = 0; i < 1000000UL; i++) {
-        if (NVME_CSTS_SHST(NVME_R32(base, pciDev, NVME_REG_CSTS)) == 2)
+    /* Request normal shutdown; wait for CSTS.SHST = 10b (complete),
+     * bounded poll — the backing memory is about to be freed. */
+    ULONG cc = NVME_R32(base, NULL, NVME_REG_CC);
+    NVME_W32(base, NULL, NVME_REG_CC, (cc & ~(3 << 14)) | NVME_CC_SHN_NORM);
+    ULONG i;
+    for (i = 0; i < 1000000UL; i++) {
+        if (NVME_CSTS_SHST(NVME_R32(base, NULL, NVME_REG_CSTS)) == 2)
             break;
     }
+    if (i == 1000000UL)
+        DLOG(IExec, "[nvme.device:init] ctrl %lu shutdown poll timed out\n",
+             ctrl->ctrl_idx);
 
-    /* Free identify buffer */
-    if (devBase->identify_buf) {
-        IExec->EndDMA(devBase->identify_buf, 4096, DMA_ReadFromRAM);
-        if (devBase->identify_dma)
-            IExec->FreeSysObject(ASOT_DMAENTRY, devBase->identify_dma);
-        IExec->FreeVec(devBase->identify_buf);
-        devBase->identify_buf = NULL;
-        devBase->identify_dma = NULL;
+    if (ctrl->identify_buf) {
+        IExec->EndDMA(ctrl->identify_buf, 4096, 0);
+        NVME_LEAK_DEC(nvme_leak_dma);
+        if (ctrl->identify_dma) {
+            IExec->FreeSysObject(ASOT_DMAENTRY, ctrl->identify_dma);
+            NVME_LEAK_DEC(nvme_leak_dmaentry);
+        }
+        IExec->FreeVec(ctrl->identify_buf);
+        NVME_LEAK_DEC(nvme_leak_vec);
+        ctrl->identify_buf = NULL;
+        ctrl->identify_dma = NULL;
     }
 
-    /* Free admin queues */
     ULONG sq_bytes = NVME_ADMIN_QUEUE_DEPTH * NVME_SQE_SIZE;
     ULONG cq_bytes = NVME_ADMIN_QUEUE_DEPTH * NVME_CQE_SIZE;
-    if (devBase->admin_sq_dma) {
-        IExec->EndDMA(devBase->admin_sq, sq_bytes, DMA_ReadFromRAM);
-        IExec->FreeSysObject(ASOT_DMAENTRY, devBase->admin_sq_dma);
-        devBase->admin_sq_dma = NULL;
+
+    if (ctrl->admin_sq_dma) {
+        IExec->EndDMA(ctrl->admin_sq, sq_bytes, DMA_ReadFromRAM);
+        NVME_LEAK_DEC(nvme_leak_dma);
+        IExec->FreeSysObject(ASOT_DMAENTRY, ctrl->admin_sq_dma);
+        NVME_LEAK_DEC(nvme_leak_dmaentry);
+        ctrl->admin_sq_dma = NULL;
     }
-    if (devBase->admin_cq_dma) {
-        IExec->EndDMA(devBase->admin_cq, cq_bytes, DMA_ReadFromRAM);
-        IExec->FreeSysObject(ASOT_DMAENTRY, devBase->admin_cq_dma);
-        devBase->admin_cq_dma = NULL;
+    if (ctrl->admin_cq_dma) {
+        IExec->EndDMA(ctrl->admin_cq, cq_bytes, 0);
+        NVME_LEAK_DEC(nvme_leak_dma);
+        IExec->FreeSysObject(ASOT_DMAENTRY, ctrl->admin_cq_dma);
+        NVME_LEAK_DEC(nvme_leak_dmaentry);
+        ctrl->admin_cq_dma = NULL;
     }
-    if (devBase->admin_sq) { IExec->FreeVec(devBase->admin_sq); devBase->admin_sq = NULL; }
-    if (devBase->admin_cq) { IExec->FreeVec(devBase->admin_cq); devBase->admin_cq = NULL; }
+    if (ctrl->admin_sq) {
+        IExec->FreeVec(ctrl->admin_sq);
+        NVME_LEAK_DEC(nvme_leak_vec);
+        ctrl->admin_sq = NULL;
+    }
+    if (ctrl->admin_cq) {
+        IExec->FreeVec(ctrl->admin_cq);
+        NVME_LEAK_DEC(nvme_leak_vec);
+        ctrl->admin_cq = NULL;
+    }
 }

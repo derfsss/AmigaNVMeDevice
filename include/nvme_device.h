@@ -21,6 +21,10 @@
 
 #include "version.h"
 #include "nvme.h"
+#include "nvme_debug.h"
+#include "nvme_leak.h"
+#include "nvme_platform.h"
+#include "nvme_stats.h"
 
 /* ------------------------------------------------------------------ */
 /* Inflight I/O slot — one per in-flight NVMe I/O command              */
@@ -37,10 +41,23 @@ struct NVMeInflight {
     ULONG            dma_size;
     struct DMAEntry *dma_list;
     ULONG            dma_entries;
+    ULONG            dma_flags;     /* DMA direction flags for EndDMA */
 
     /* Bounce buffer path (transfer <= NVME_BOUNCE_SIZE) */
     BOOL             use_bounce;
+
+    /* For latency tracking — EClock snapshot taken at Submit time,
+     * consumed at Harvest.  A 64-bit tick count lives across the two
+     * halves of a DoIO. */
+    uint32           submit_ticks_hi;
+    uint32           submit_ticks_lo;
 };
+
+/* Forward decls — NVMeBase/NVMeUnit/NVMeController form a mutually
+ * referential cluster; each struct carries a back-pointer to the ones
+ * that logically contain it. */
+struct NVMeBase;
+struct NVMeController;
 
 /* ------------------------------------------------------------------ */
 /* NVMeUnit — one per NVMe namespace (AmigaOS device unit)             */
@@ -48,16 +65,16 @@ struct NVMeInflight {
 
 struct NVMeUnit {
     struct Unit      unit_Base;
-    ULONG            unit_num;      /* 0-based AmigaOS unit number */
+    ULONG            unit_num;      /* 0-based FLAT AmigaOS unit number */
     ULONG            nsid;          /* NVMe namespace ID (1-based) */
     ULONG            open_count;
 
     /* Geometry (populated from Identify Namespace) */
     ULONG            block_size;    /* bytes per LBA */
-    UQUAD            total_blocks;  /* total LBAs */
+    uint64            total_blocks;  /* total LBAs */
     ULONG            block_shift;   /* log2(block_size) */
 
-    /* Per-unit I/O queues (queue ID = unit_num + 1) */
+    /* Per-unit I/O queues (queue ID = local_idx + 1 within controller) */
     APTR             io_sq;         /* virtual address, MEMF_SHARED */
     APTR             io_cq;         /* virtual address, MEMF_SHARED */
     ULONG            io_sq_phys;    /* physical address */
@@ -66,15 +83,26 @@ struct NVMeUnit {
     UWORD            io_cq_head;    /* next slot to read */
     UBYTE            io_cq_phase;   /* expected phase bit */
     UWORD            queue_depth;   /* number of entries (NVME_IO_QUEUE_DEPTH) */
-    UWORD            queue_id;      /* NVMe queue ID (= unit_num + 1) */
+    UWORD            queue_id;      /* NVMe queue ID (1..NVME_MAX_UNITS_PER_CTRL) */
 
-    /* Unit task */
-    struct Task     *task;
+    /* Unit task.  `task` and `task_shutdown` are touched by two tasks
+     * at a time (parent + unit task); `volatile` stops the compiler
+     * from caching them across the Forbid/Permit or Wait calls used to
+     * synchronise. */
+    struct Task     *volatile task;
     struct MsgPort  *io_port;
     ULONG            io_port_mask;
     ULONG            io_signal_mask; /* ISR signals this bit to wake task */
     struct Task     *io_wait_task;   /* = task once started; ISR checks this */
-    BOOL             task_shutdown;
+    volatile BOOL    task_shutdown;
+
+    /* Shutdown handshake: parent AllocSignals a bit in its own task,
+     * hands the mask + task pointer to the unit task, then Wait()s on
+     * the mask.  Unit task Signal()s the parent immediately before
+     * clearing unit->task.  Replaces the original Forbid/Permit busy-
+     * wait, which did not yield CPU to same-priority tasks. */
+    struct Task     *shutdown_ack_task;
+    ULONG            shutdown_ack_mask;
 
     /* I/O pipeline (NVME_MAX_INFLIGHT inflight slots) */
     struct NVMeInflight inflight[NVME_MAX_INFLIGHT];
@@ -90,9 +118,86 @@ struct NVMeUnit {
 
     /* Held change-notification requests (must NOT be replied to until removed) */
     struct IOStdReq *changeint_req;
+    struct IOStdReq *remove_req;       /* held TD_REMOVE request */
 
-    /* Back-pointer to device base */
-    struct NVMeBase *dev_base;
+    /* Per-unit live statistics — updated in the hot paths. */
+    struct NVMeUnitStats stats;
+
+    /* Back-pointers.  `ctrl` is the fast way to reach admin queues,
+     * BAR0, and IRQ state; `dev_base` is kept for codepaths that need
+     * the driver library base (mounter.library handle, utility, etc.). */
+    struct NVMeController *ctrl;
+    struct NVMeBase       *dev_base;
+};
+
+/* ------------------------------------------------------------------ */
+/* NVMeController — per-physical-controller state                      */
+/*                                                                      */
+/* One PCI NVMe controller.  Holds its own BAR0, admin queues, IRQ     */
+/* vector, and up to NVME_MAX_UNITS_PER_CTRL namespace units.  A       */
+/* typical system has exactly one of these; the array on NVMeBase      */
+/* supports configurations with multiple controllers (RAID, ZFS L2ARC, */
+/* etc.) without re-plumbing the I/O paths.                            */
+/* ------------------------------------------------------------------ */
+
+struct NVMeController {
+    /* PCI identity */
+    struct PCIDevice        *pciDevice;
+    struct PCIResourceRange *bar0;          /* NVMe register region */
+    ULONG                    iobase;        /* CPU-mapped MMIO base */
+
+    /* Admin-command serialisation. */
+    struct SignalSemaphore   io_lock;
+
+    /* CAP-derived parameters. */
+    ULONG                    cap_mqes;      /* max queue entries */
+    ULONG                    cap_dstrd;     /* doorbell stride exponent */
+    ULONG                    page_size;     /* host page size */
+    ULONG                    max_transfer_bytes;  /* MDTS-derived cap */
+
+    /* Admin SQ/CQ pair (one per controller). */
+    APTR                     admin_sq;
+    APTR                     admin_cq;
+    ULONG                    admin_sq_phys;
+    ULONG                    admin_cq_phys;
+    struct DMAEntry         *admin_sq_dma;
+    struct DMAEntry         *admin_cq_dma;
+    UWORD                    admin_sq_tail;
+    UWORD                    admin_cq_head;
+    UBYTE                    admin_cq_phase;
+    UWORD                    next_cmd_id;
+
+    /* Shared 4 KiB Identify scratch buffer. */
+    APTR                     identify_buf;
+    ULONG                    identify_phys;
+    struct DMAEntry         *identify_dma;
+
+    /* Units belonging to this controller, local indexing. */
+    struct NVMeUnit         *units[NVME_MAX_UNITS_PER_CTRL];
+    ULONG                    num_units;
+
+    /* Interrupt state. */
+    struct Interrupt         irq_handler;
+    BOOL                     irq_installed;
+    ULONG                    irq_vector;
+    BOOL                     polling_mode;
+
+    /* Identify-derived static info (captured in NVMe_IdentifyController).
+     * Kept as fixed-length strings so the stats snapshot can copy them
+     * out without re-running Identify. */
+    char                     model[41];     /* MN, NUL-padded  */
+    char                     serial[21];    /* SN, NUL-padded  */
+    char                     fw_rev[9];     /* FR, NUL-padded  */
+
+#ifdef ENABLE_SMART
+    /* SMART / Health Information Log cache.  Populated lazily on the
+     * first NSCMD_NVME_GETSTATS after NVME_SMART_REFRESH_SECS elapse. */
+    struct NVMeSMARTCache    smart_cache;
+#endif
+
+    /* Identity / location. */
+    ULONG                    ctrl_idx;      /* index within NVMeBase.controllers[] */
+    struct NVMeBase         *dev_base;      /* back-pointer */
 };
 
 /* ------------------------------------------------------------------ */
@@ -108,43 +213,18 @@ struct NVMeBase {
     struct UtilityIFace     *IUtility;
     BPTR                     dev_SegList;
 
-    /* Admin queue serialisation — held for all admin commands */
-    struct SignalSemaphore   io_lock;
+    /* Per-physical-controller state. */
+    struct NVMeController    controllers[NVME_MAX_CONTROLLERS];
+    ULONG                    num_controllers;
 
-    /* PCI device and BAR0 */
-    struct PCIDevice        *pciDevice;
-    struct PCIResourceRange *bar0;      /* BAR0: NVMe register region */
-    ULONG                    iobase;    /* bar0->Physical — base for pciDev->InX() */
+    /* Flat unit table — unit_num is the index.  Allows Open/BeginIO
+     * to resolve a unit without knowing which controller owns it.
+     * Each pointer also appears in exactly one ctrl->units[] slot. */
+    struct NVMeUnit         *global_units[NVME_MAX_GLOBAL_UNITS];
+    ULONG                    num_global_units;
 
-    /* Controller capabilities (read from CAP register at init) */
-    ULONG                    cap_mqes;  /* max queue entries per queue (from CAP[15:0]) */
-    ULONG                    cap_dstrd; /* doorbell stride (0 = 4 bytes) */
-    ULONG                    page_size; /* host page size in bytes (4096 minimum) */
-
-    /* Admin queues (shared, one pair for the whole controller) */
-    APTR                     admin_sq;      /* virtual, MEMF_SHARED, 64*64 bytes */
-    APTR                     admin_cq;      /* virtual, MEMF_SHARED, 64*16 bytes */
-    ULONG                    admin_sq_phys;
-    ULONG                    admin_cq_phys;
-    struct DMAEntry         *admin_sq_dma;
-    struct DMAEntry         *admin_cq_dma;
-    UWORD                    admin_sq_tail;
-    UWORD                    admin_cq_head;
-    UBYTE                    admin_cq_phase;  /* expected phase bit */
-    UWORD                    next_cmd_id;     /* rolling 16-bit command ID counter */
-
-    /* 4KB identify scratch buffer (DMA-mapped, reused for all Identify calls at init) */
-    APTR                     identify_buf;
-    ULONG                    identify_phys;
-    struct DMAEntry         *identify_dma;
-
-    /* Units (one per NVMe namespace, up to 8) */
-    struct NVMeUnit         *units[8];
-    ULONG                    num_units;
-
-    /* Interrupt handler */
-    struct Interrupt         irq_handler;
-    BOOL                     irq_installed;
+    /* Host platform identification (shared by all controllers). */
+    NVMePlatform             platform;
 };
 
 /* ------------------------------------------------------------------ */
@@ -162,30 +242,51 @@ ULONG                _manager_Obtain(struct DeviceManagerInterface *Self);
 ULONG                _manager_Release(struct DeviceManagerInterface *Self);
 
 /* ------------------------------------------------------------------ */
-/* Debugging macro                                                      */
-/* ------------------------------------------------------------------ */
-
-#ifdef DEBUG
-#define DPRINTF(iexec, ...) ((iexec)->DebugPrintF(__VA_ARGS__))
-#else
-#define DPRINTF(iexec, ...)                         \
-    do {                                            \
-        if (0)                                      \
-            ((struct ExecIFace *)(iexec))->DebugPrintF(__VA_ARGS__); \
-    } while (0)
-#endif
-
-/* ------------------------------------------------------------------ */
-/* NVMe register access via pciDev->InX() / OutX()                     */
+/* NVMe register access — cache-inhibited memory-mapped BAR0           */
 /*                                                                      */
-/* These go through the expansion.library PCIDevice bridge layer and   */
-/* work correctly on AmigaOne's Articia-S chipset. The methods handle  */
-/* endian conversion automatically (PCI_MODE_REVERSE_ENDIAN).          */
+/* NVMe registers live in a memory BAR that any working PCIe bridge    */
+/* maps into the CPU address space.  The bridge does NOT byte-swap the */
+/* register data — NVMe registers are defined by the spec as little-   */
+/* endian, so on PowerPC (big-endian) we swap in software via the      */
+/* byte-reversed load/store instructions:                              */
+/*     lwbrx rT, 0, rA   — load word byte-reversed (LE load)           */
+/*     stwbrx rS, 0, rA  — store word byte-reversed (LE store)         */
+/*                                                                      */
+/* Ordering: every MMIO store is followed by a heavy `sync` (aka mbar) */
+/* rather than `eieio`.  Under QEMU TCG, `eieio` is known to be too    */
+/* weak to force the store out of the CPU pipeline before the next     */
+/* instruction reads it back; `sync` is architecturally strict enough  */
+/* to be safe on both QEMU and real hardware.  Pattern borrowed from   */
+/* VirtIOGPU after the same problem bit that driver.                   */
+/*                                                                      */
+/* DMA buffers (SQE/CQE and PRP data in RAM) are NOT routed through    */
+/* the bridge's endian swap — they travel as raw bytes.  The CPU must  */
+/* therefore write SQEs in LE form (see dma_w32/dma_r32 helpers in     */
+/* nvme_admin.c / nvme_io.c).                                          */
 /* ------------------------------------------------------------------ */
 
-#define NVME_R32(base, dev, off)     ((dev)->InLong((base) + (off)))
-#define NVME_W32(base, dev, off, v)  ((dev)->OutLong((base) + (off), (v)))
-#define NVME_R16(base, dev, off)     ((dev)->InWord((base) + (off)))
-#define NVME_W16(base, dev, off, v)  ((dev)->OutWord((base) + (off), (v)))
+/* Read a 32-bit little-endian register via lwbrx. */
+static inline ULONG nvme_r32(ULONG addr)
+{
+    ULONG val;
+    __asm__ volatile ("lwbrx %0, 0, %1" : "=r"(val) : "r"(addr));
+    return val;
+}
+
+/* Write a 32-bit little-endian register via stwbrx + sync.
+ * `sync` is a full memory barrier (PowerPC architected; same encoding as
+ * `mbar`).  We intentionally pay that cost on every MMIO write — NVMe
+ * doorbell writes are rare on the hot path, and correctness under QEMU
+ * TCG outweighs the extra cycles. */
+static inline void nvme_w32(ULONG addr, ULONG val)
+{
+    __asm__ volatile ("stwbrx %0, 0, %1; sync"
+                      : : "r"(val), "r"(addr) : "memory");
+}
+
+#define NVME_R32(base, dev, off)     nvme_r32((base) + (off))
+#define NVME_W32(base, dev, off, v)  nvme_w32((base) + (off), (v))
+#define NVME_W32_DB(pciDev, base, off, v) \
+    nvme_w32((base) + (off), (v))
 
 #endif /* NVME_DEVICE_H */

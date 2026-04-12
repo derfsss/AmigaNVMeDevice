@@ -1,3 +1,21 @@
+/*
+ * device.c — Resident tag, manager interface vector, and exec entry stub.
+ *
+ * The Resident struct is scanned by exec at boot.  RTF_AUTOINIT tells
+ * exec to follow CLT_InitFunc (== _manager_Init) and treat the library
+ * as ready to use after that returns non-NULL.  RTF_COLDSTART + priority
+ * 0 matches virtioscsi.device / disk.device, which lets diskboot.kmod
+ * consider nvme.device as a boot-drive candidate.
+ *
+ * The _manager_Vectors table is the v1 "__device" interface: Obtain /
+ * Release / [reserved] / [reserved] / Open / Close / Expunge /
+ * [reserved] / BeginIO / AbortIO.  Entries we do not implement stay
+ * NULL; the table is terminated with (APTR)-1.
+ *
+ * _start exists only so the binary can survive being double-clicked —
+ * it returns 0 immediately rather than jumping into random driver code.
+ */
+
 #include "version.h"
 #include "nvme_device.h"
 #include <exec/exectags.h>
@@ -60,7 +78,11 @@ static const struct Resident dev_res __attribute__((used)) = {
     RTF_NATIVE | RTF_COLDSTART | RTF_AUTOINIT,
     DEVVER,
     NT_DEVICE,
-    -60,              /* init after mounter.library */
+    /* Resident priority 0 matches virtioscsi.device and disk.device: it
+     * lets diskboot.kmod evaluate us as a boot-drive candidate.  mounter.library
+     * is listed in diskboot.config ahead of us, so it is already resident by
+     * the time we initialise. */
+    0,
     DEVNAME,
     DEVVERSIONSTRING,
     (APTR)dev_init_tags

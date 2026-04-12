@@ -4,38 +4,41 @@
 #include <exec/types.h>
 
 /*
- * nvme.h — NVMe controller register offsets, field definitions,
- *           submission/completion queue entry structures, and opcodes.
+ * nvme.h — NVMe controller register layout, queue entry structures,
+ * opcodes, and constants used across the driver.
  *
- * NVMe registers are 32-bit little-endian. On AmigaOne (Articia-S bridge)
- * they are accessed via pciDev->InLong()/OutLong() etc., which handle
- * the endian swap automatically (same pattern as legacy VirtIO).
+ * All citations of the form "§x.y" refer to NVM Express Base
+ * Specification 1.4 (NVMe 1.4).  Field widths and register offsets are
+ * defined by that revision.
  *
- * All offsets are relative to BAR0->Physical.
+ * NVMe controller registers occupy BAR0 and are defined by the spec as
+ * 32-bit little-endian.  On PowerPC we swap in software via the byte-
+ * reversed load/store inline primitives in nvme_device.h (nvme_r32 /
+ * nvme_w32).  All offsets below are relative to the BAR0 base.
  */
 
 /* ------------------------------------------------------------------ */
-/* BAR0 register offsets                                               */
+/* BAR0 register offsets — NVMe 1.4 §3.1 "Controller Registers"        */
 /* ------------------------------------------------------------------ */
 
-#define NVME_REG_CAP_LO  0x00  /* Controller Capabilities [31:0] */
-#define NVME_REG_CAP_HI  0x04  /* Controller Capabilities [63:32] */
-#define NVME_REG_VS      0x08  /* Version */
-#define NVME_REG_INTMS   0x0C  /* Interrupt Mask Set */
-#define NVME_REG_INTMC   0x10  /* Interrupt Mask Clear */
-#define NVME_REG_CC      0x14  /* Controller Configuration */
-#define NVME_REG_CSTS    0x1C  /* Controller Status */
-#define NVME_REG_NSSR    0x20  /* NVM Subsystem Reset */
-#define NVME_REG_AQA     0x24  /* Admin Queue Attributes */
-#define NVME_REG_ASQ_LO  0x28  /* Admin SQ Base Address [31:0] */
-#define NVME_REG_ASQ_HI  0x2C  /* Admin SQ Base Address [63:32] */
-#define NVME_REG_ACQ_LO  0x30  /* Admin CQ Base Address [31:0] */
-#define NVME_REG_ACQ_HI  0x34  /* Admin CQ Base Address [63:32] */
+#define NVME_REG_CAP_LO  0x00  /* §3.1.1 CAP [31:0]  — MQES, CQR, AMS,… */
+#define NVME_REG_CAP_HI  0x04  /* §3.1.1 CAP [63:32] — DSTRD, NSSRS,…   */
+#define NVME_REG_VS      0x08  /* §3.1.2 VS   Version                   */
+#define NVME_REG_INTMS   0x0C  /* §3.1.3 INTMS  Interrupt Mask Set      */
+#define NVME_REG_INTMC   0x10  /* §3.1.4 INTMC  Interrupt Mask Clear    */
+#define NVME_REG_CC      0x14  /* §3.1.5 CC     Controller Configuration*/
+#define NVME_REG_CSTS    0x1C  /* §3.1.6 CSTS   Controller Status       */
+#define NVME_REG_NSSR    0x20  /* §3.1.7 NSSR   NVM Subsystem Reset     */
+#define NVME_REG_AQA     0x24  /* §3.1.8 AQA    Admin Queue Attributes  */
+#define NVME_REG_ASQ_LO  0x28  /* §3.1.9 ASQ [31:0]                     */
+#define NVME_REG_ASQ_HI  0x2C  /* §3.1.9 ASQ [63:32] (0 on 32-bit host) */
+#define NVME_REG_ACQ_LO  0x30  /* §3.1.10 ACQ [31:0]                    */
+#define NVME_REG_ACQ_HI  0x34  /* §3.1.10 ACQ [63:32]                   */
 
-/* Doorbell registers begin at offset 0x1000.
- * Stride = 4 << CAP.DSTRD bytes.
- * SQ tail doorbell for queue y = 0x1000 + (2*y)   * stride
- * CQ head doorbell for queue y = 0x1000 + (2*y+1) * stride
+/* Doorbell registers — §3.1.24/§3.1.25.
+ * Base is BAR0 + 0x1000; stride = 4 << CAP.DSTRD bytes.
+ *   SQ y tail = 0x1000 + (2*y)   * stride
+ *   CQ y head = 0x1000 + (2*y+1) * stride
  */
 #define NVME_DOORBELL_BASE  0x1000
 #define NVME_SQ_TAIL_DB(qid, dstrd)  (NVME_DOORBELL_BASE + (2*(qid))   * (4 << (dstrd)))
@@ -175,9 +178,9 @@ struct nvme_cqe {
 /* ------------------------------------------------------------------ */
 
 struct nvme_id_ns {
-    UQUAD  nsze;         /* namespace size in LBAs */
-    UQUAD  ncap;         /* namespace capacity */
-    UQUAD  nuse;         /* namespace utilization */
+    uint64  nsze;         /* namespace size in LBAs */
+    uint64  ncap;         /* namespace capacity */
+    uint64  nuse;         /* namespace utilization */
     UBYTE  nsfeat;
     UBYTE  nlbaf;        /* number of LBA formats - 1 */
     UBYTE  flbas;        /* formatted LBA size [3:0] = index into lbaf[] */
@@ -216,8 +219,10 @@ struct nvme_id_ns {
     UBYTE  vs[3712];
 };
 
-/* LBA format data shift: lba_size = 512 << lbaf_ds */
-#define NVME_LBAF_DS(lbaf_ds_field)  ((lbaf_ds_field) & 0xF)
+/* LBA format data size: bits [23:16] = LBADS (log2 of LBA size in bytes).
+ * E.g. LBADS=9 → 512 bytes, LBADS=12 → 4096 bytes.
+ * lba_size = 1u << NVME_LBAF_LBADS(val) */
+#define NVME_LBAF_LBADS(lbaf_val)  (((lbaf_val) >> 16) & 0xFF)
 
 /* ------------------------------------------------------------------ */
 /* Identify Controller data (4096 bytes, partial)                      */
@@ -259,10 +264,29 @@ struct nvme_id_ctrl {
 /* Queue sizing constants                                              */
 /* ------------------------------------------------------------------ */
 
-#define NVME_ADMIN_QUEUE_DEPTH  64   /* entries in admin SQ and CQ */
-#define NVME_IO_QUEUE_DEPTH     64   /* entries in each I/O SQ and CQ */
-#define NVME_MAX_INFLIGHT       16   /* max pipelined I/O requests per unit */
-#define NVME_BOUNCE_SIZE        4096 /* max transfer size for bounce buffer path */
+#define NVME_ADMIN_QUEUE_DEPTH    64   /* entries in admin SQ and CQ */
+#define NVME_IO_QUEUE_DEPTH       64   /* entries in each I/O SQ and CQ */
+#define NVME_MAX_INFLIGHT         16   /* max pipelined I/O requests per unit */
+
+/* Multi-controller limits.
+ * A PCIe bus rarely carries more than a handful of NVMe controllers;
+ * four is generous and keeps NVMeBase bounded.  Up to eight units
+ * (namespaces) per controller is the original single-controller cap,
+ * retained for structural symmetry. */
+#define NVME_MAX_CONTROLLERS      4
+#define NVME_MAX_UNITS_PER_CTRL   8
+#define NVME_MAX_GLOBAL_UNITS     (NVME_MAX_CONTROLLERS * NVME_MAX_UNITS_PER_CTRL)
+
+/* Pre-pinned bounce buffer size per inflight slot.
+ *
+ * Chosen to comfortably cover typical filesystem cluster I/O (SFS
+ * clusters are 32 KiB; SSFS uses up to 64 KiB writes for stream
+ * operations).  Transfers up to and including this size take the
+ * fast-path: CopyMem between user buffer and the cached bounce, a
+ * single-page-aligned CacheClearE, and no per-request
+ * StartDMA/GetDMAList/EndDMA at all.  Larger transfers fall through
+ * to the scatter-gather PRP-list path in nvme_io.c. */
+#define NVME_BOUNCE_SIZE        (64u * 1024u)
 
 #define NVME_SQE_SIZE  64            /* bytes per SQ entry */
 #define NVME_CQE_SIZE  16            /* bytes per CQ entry */

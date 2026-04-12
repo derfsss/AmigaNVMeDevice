@@ -1,160 +1,374 @@
 /*
- * test_nvme.c — Basic nvme.device test program
+ * test_nvme.c — Functional test program for nvme.device.
  *
- * Compile: ppc-amigaos-gcc -O2 -Wall test_nvme.c -o test_nvme -lauto
- * Run on AmigaOS: test_nvme [unit]
+ * Usage from AmigaOS shell:   test_nvme [unit]
+ *   unit  — unit number to open (default 0).  With the multi-controller
+ *           driver, units are numbered flat across controllers so e.g.
+ *           unit 0 is controller 0's first namespace.
  *
- * Tests performed:
- *   1. OpenDevice("nvme.device", unit, ...)
- *   2. NSCMD_DEVICEQUERY — list supported commands
- *   3. TD_GETGEOMETRY    — print disk size
- *   4. CMD_READ block 0  — read first 512 bytes
- *   5. CMD_WRITE + CMD_READ verify — write pattern to last block, read back
- *   6. CMD_UPDATE (flush)
- *   7. CloseDevice
+ * Tests performed, in order:
+ *
+ *   1. Identification banner + OpenDevice
+ *   2. NSCMD_DEVICEQUERY  — list supported commands + device type
+ *   3. TD_GETGEOMETRY     — synthetic CHS geometry
+ *   4. NSCMD_TD_GETGEOMETRY64 — full 64-bit geometry
+ *   5. HD_SCSICMD INQUIRY — vendor/product/revision strings
+ *   6. CMD_READ block 0
+ *   7. CMD_WRITE + CMD_UPDATE + CMD_READ  — 512-byte single-block verify
+ *   8. 64 KiB bounce-buffer round-trip verify at offset 4 KiB
+ *   9. TD_READ64 at a high offset (> 4 GiB into the namespace, if the
+ *      namespace is large enough)
+ *  10. CloseDevice
+ *
+ * Built with -lauto so the clib4 CRT is linked and IExec/IDOS are
+ * auto-opened.  All I/O uses IExec->DoIO so failures are synchronous.
  */
 
 #include <exec/exec.h>
 #include <exec/io.h>
 #include <exec/memory.h>
+#include <exec/errors.h>
 #include <devices/trackdisk.h>
 #include <devices/newstyle.h>
+#include <devices/scsidisk.h>
+#include <libraries/mounter.h>    /* DriveGeometry64 */
 #include <proto/exec.h>
 #include <proto/dos.h>
+#include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+#ifndef BUILD_DATE
+#define BUILD_DATE "unknown"
+#endif
+#ifndef BUILD_TIME
+#define BUILD_TIME "unknown"
+#endif
 
 #define DEVNAME "nvme.device"
 
-static struct IOStdReq *create_ioreq(struct MsgPort *port)
+/* NSCMD_TD_GETGEOMETRY64 may not be in every SDK release. */
+#ifndef NSCMD_TD_GETGEOMETRY64
+#define NSCMD_TD_GETGEOMETRY64  0xA004
+#endif
+
+static int g_fail_count = 0;
+static int g_pass_count = 0;
+
+static void report(BOOL pass, const char *fmt, ...)
 {
-    return (struct IOStdReq *)CreateIORequest(port, sizeof(struct IOStdReq));
+    va_list ap;
+    if (pass) g_pass_count++; else g_fail_count++;
+    printf("%s: ", pass ? "PASS" : "FAIL");
+    va_start(ap, fmt);
+    vprintf(fmt, ap);
+    va_end(ap);
+    printf("\n");
 }
 
 int main(int argc, char *argv[])
 {
     ULONG unit = 0;
     if (argc > 1)
-        unit = strtol(argv[1], NULL, 10);
+        unit = (ULONG)strtol(argv[1], NULL, 10);
 
-    printf("nvme.device test — unit %lu\n", unit);
+    printf("test_nvme built %s %s — opening %s unit %lu\n",
+           BUILD_DATE, BUILD_TIME, DEVNAME, unit);
 
-    struct MsgPort  *port  = CreateMsgPort();
-    struct IOStdReq *ioreq = create_ioreq(port);
-    if (!port || !ioreq) {
-        printf("FAIL: could not create message port/ioreq\n");
+    struct MsgPort *port = IExec->AllocSysObjectTags(ASOT_PORT, TAG_DONE);
+    if (!port) {
+        printf("FAIL: could not create message port\n");
         return 1;
     }
 
-    /* 1. Open device */
-    LONG err = OpenDevice(DEVNAME, unit, (struct IORequest *)ioreq, 0);
+    struct IOStdReq *ioreq = (struct IOStdReq *)
+        IExec->AllocSysObjectTags(ASOT_IOREQUEST,
+            ASOIOR_Size,      sizeof(struct IOStdReq),
+            ASOIOR_ReplyPort, port,
+            TAG_DONE);
+    if (!ioreq) {
+        printf("FAIL: could not create ioreq\n");
+        IExec->FreeSysObject(ASOT_PORT, port);
+        return 1;
+    }
+
+    /* -------------------------------------------------------------- */
+    /* 1. OpenDevice                                                   */
+    /* -------------------------------------------------------------- */
+    LONG err = IExec->OpenDevice(DEVNAME, unit, (struct IORequest *)ioreq, 0);
     if (err != 0) {
         printf("FAIL: OpenDevice returned %ld\n", err);
-        DeleteIORequest((struct IORequest *)ioreq);
-        DeleteMsgPort(port);
+        IExec->FreeSysObject(ASOT_IOREQUEST, ioreq);
+        IExec->FreeSysObject(ASOT_PORT, port);
         return 1;
     }
-    printf("PASS: OpenDevice unit %lu\n", unit);
+    report(TRUE, "OpenDevice unit %lu", unit);
 
-    /* 2. NSCMD_DEVICEQUERY */
+    /* -------------------------------------------------------------- */
+    /* 2. NSCMD_DEVICEQUERY                                            */
+    /* -------------------------------------------------------------- */
     struct NSDeviceQueryResult qr;
     memset(&qr, 0, sizeof(qr));
     ioreq->io_Command = NSCMD_DEVICEQUERY;
     ioreq->io_Data    = &qr;
     ioreq->io_Length  = sizeof(qr);
-    if (DoIO((struct IORequest *)ioreq) == 0) {
-        printf("PASS: NSCMD_DEVICEQUERY — DeviceType=%lu\n", (ULONG)qr.DeviceType);
+    if (IExec->DoIO((struct IORequest *)ioreq) == 0) {
+        report(TRUE, "NSCMD_DEVICEQUERY — DeviceType=%lu", (ULONG)qr.DeviceType);
         if (qr.SupportedCommands) {
-            printf("      Supported commands:");
+            printf("      Supported:");
             for (UWORD *cmd = qr.SupportedCommands; *cmd; cmd++)
                 printf(" %u", *cmd);
             printf("\n");
         }
     } else {
-        printf("FAIL: NSCMD_DEVICEQUERY error %d\n", ioreq->io_Error);
+        report(FALSE, "NSCMD_DEVICEQUERY io_Error=%d", ioreq->io_Error);
     }
 
-    /* 3. TD_GETGEOMETRY */
+    /* -------------------------------------------------------------- */
+    /* 3. TD_GETGEOMETRY (synthetic CHS)                               */
+    /* -------------------------------------------------------------- */
     struct DriveGeometry dg;
     memset(&dg, 0, sizeof(dg));
     ioreq->io_Command = TD_GETGEOMETRY;
     ioreq->io_Data    = &dg;
     ioreq->io_Length  = sizeof(dg);
-    if (DoIO((struct IORequest *)ioreq) == 0) {
-        UQUAD total_bytes = (UQUAD)dg.dg_TotalSectors * dg.dg_SectorSize;
-        printf("PASS: TD_GETGEOMETRY — SectorSize=%lu TotalSectors=%lu (~%lu MB)\n",
-               dg.dg_SectorSize, dg.dg_TotalSectors,
-               (ULONG)(total_bytes / (1024*1024)));
+    uint64 total_bytes_32 = 0;
+    if (IExec->DoIO((struct IORequest *)ioreq) == 0) {
+        total_bytes_32 = (uint64)dg.dg_TotalSectors * dg.dg_SectorSize;
+        report(TRUE, "TD_GETGEOMETRY  sectors=%lu size=%lu"
+                     " (~%lu MiB using 32-bit total)",
+               dg.dg_TotalSectors, dg.dg_SectorSize,
+               (ULONG)(total_bytes_32 / (1024u*1024u)));
     } else {
-        printf("FAIL: TD_GETGEOMETRY error %d\n", ioreq->io_Error);
+        report(FALSE, "TD_GETGEOMETRY io_Error=%d", ioreq->io_Error);
     }
 
-    /* Allocate aligned read/write buffer */
-    UBYTE *buf = AllocVec(512, MEMF_PUBLIC | MEMF_CLEAR);
+    /* -------------------------------------------------------------- */
+    /* 4. NSCMD_TD_GETGEOMETRY64 (full 64-bit)                         */
+    /* -------------------------------------------------------------- */
+    struct DriveGeometry64 dg64;
+    memset(&dg64, 0, sizeof(dg64));
+    ioreq->io_Command = NSCMD_TD_GETGEOMETRY64;
+    ioreq->io_Data    = &dg64;
+    ioreq->io_Length  = sizeof(dg64);
+    uint64 true_total_bytes = 0;
+    uint32 true_sector_size = 512;
+    if (IExec->DoIO((struct IORequest *)ioreq) == 0) {
+        true_total_bytes = dg64.dg_TotalSectors * dg64.dg_SectorSize;
+        true_sector_size = dg64.dg_SectorSize;
+        report(TRUE, "NSCMD_TD_GETGEOMETRY64 sectors=(hi:%lu lo:%lu) size=%lu"
+                     " → (hi:%lu lo:%lu) bytes",
+               (ULONG)(dg64.dg_TotalSectors >> 32),
+               (ULONG)(dg64.dg_TotalSectors & 0xFFFFFFFFu),
+               (ULONG)dg64.dg_SectorSize,
+               (ULONG)(true_total_bytes >> 32),
+               (ULONG)(true_total_bytes & 0xFFFFFFFFu));
+    } else {
+        report(FALSE, "NSCMD_TD_GETGEOMETRY64 io_Error=%d", ioreq->io_Error);
+    }
+
+    /* -------------------------------------------------------------- */
+    /* 5. HD_SCSICMD INQUIRY                                           */
+    /* -------------------------------------------------------------- */
+    {
+        UBYTE inqbuf[96];
+        UBYTE sense[18];
+        UBYTE cdb[6] = { 0x12, 0x00, 0x00, 0x00, sizeof(inqbuf), 0x00 };
+        struct SCSICmd scsi;
+        memset(&scsi, 0, sizeof(scsi));
+        memset(inqbuf, 0, sizeof(inqbuf));
+        scsi.scsi_Data        = (UWORD *)inqbuf;
+        scsi.scsi_Length      = sizeof(inqbuf);
+        scsi.scsi_Command     = cdb;
+        scsi.scsi_CmdLength   = sizeof(cdb);
+        scsi.scsi_SenseData   = sense;
+        scsi.scsi_SenseLength = sizeof(sense);
+        scsi.scsi_Flags       = SCSIF_AUTOSENSE | SCSIF_READ;
+
+        ioreq->io_Command = HD_SCSICMD;
+        ioreq->io_Data    = &scsi;
+        ioreq->io_Length  = sizeof(scsi);
+        if (IExec->DoIO((struct IORequest *)ioreq) == 0) {
+            char vendor[9], product[17], revision[5];
+            memcpy(vendor,   inqbuf + 8,  8); vendor[8]    = '\0';
+            memcpy(product,  inqbuf + 16, 16); product[16] = '\0';
+            memcpy(revision, inqbuf + 32, 4); revision[4]  = '\0';
+            report(TRUE, "HD_SCSICMD INQUIRY vendor=\"%s\" product=\"%s\" rev=\"%s\"",
+                   vendor, product, revision);
+        } else {
+            report(FALSE, "HD_SCSICMD INQUIRY io_Error=%d", ioreq->io_Error);
+        }
+    }
+
+    UBYTE *buf = IExec->AllocVecTags(512,
+        AVT_Type,      MEMF_SHARED,
+        AVT_Alignment, 512,
+        AVT_Clear,     0,
+        TAG_DONE);
     if (!buf) {
-        printf("FAIL: AllocVec\n");
+        report(FALSE, "AllocVecTags 512");
         goto done;
     }
 
-    /* 4. CMD_READ block 0 */
+    /* -------------------------------------------------------------- */
+    /* 6. CMD_READ block 0                                             */
+    /* -------------------------------------------------------------- */
     ioreq->io_Command = CMD_READ;
     ioreq->io_Data    = buf;
     ioreq->io_Length  = 512;
     ioreq->io_Offset  = 0;
-    if (DoIO((struct IORequest *)ioreq) == 0) {
-        printf("PASS: CMD_READ block 0 — first 4 bytes: %02X %02X %02X %02X\n",
+    if (IExec->DoIO((struct IORequest *)ioreq) == 0) {
+        report(TRUE, "CMD_READ block 0  — bytes: %02X %02X %02X %02X",
                buf[0], buf[1], buf[2], buf[3]);
     } else {
-        printf("FAIL: CMD_READ error %d\n", ioreq->io_Error);
+        report(FALSE, "CMD_READ block 0 io_Error=%d", ioreq->io_Error);
     }
 
-    /* 5. CMD_WRITE + readback verify (write to block 1 — safe, avoids MBR) */
+    /* -------------------------------------------------------------- */
+    /* 7. 512-byte single-block write + flush + read-back verify       */
+    /* -------------------------------------------------------------- */
     memset(buf, 0xA5, 512);
     ioreq->io_Command = CMD_WRITE;
     ioreq->io_Data    = buf;
     ioreq->io_Length  = 512;
-    ioreq->io_Offset  = 512; /* block 1 */
-    if (DoIO((struct IORequest *)ioreq) == 0) {
-        printf("PASS: CMD_WRITE block 1\n");
+    ioreq->io_Offset  = 512;   /* block 1 — keeps MBR intact */
+    if (IExec->DoIO((struct IORequest *)ioreq) == 0) {
+        report(TRUE, "CMD_WRITE block 1 pattern 0xA5");
 
-        /* CMD_UPDATE (flush) */
         ioreq->io_Command = CMD_UPDATE;
         ioreq->io_Data    = NULL;
         ioreq->io_Length  = 0;
         ioreq->io_Offset  = 0;
-        if (DoIO((struct IORequest *)ioreq) == 0)
-            printf("PASS: CMD_UPDATE (flush)\n");
+        if (IExec->DoIO((struct IORequest *)ioreq) == 0)
+            report(TRUE, "CMD_UPDATE (Flush)");
         else
-            printf("WARN: CMD_UPDATE error %d (may not be supported)\n", ioreq->io_Error);
+            printf("WARN: CMD_UPDATE io_Error=%d (may not be supported)\n",
+                   ioreq->io_Error);
 
-        /* Readback */
         memset(buf, 0, 512);
         ioreq->io_Command = CMD_READ;
         ioreq->io_Data    = buf;
         ioreq->io_Length  = 512;
         ioreq->io_Offset  = 512;
-        if (DoIO((struct IORequest *)ioreq) == 0) {
+        if (IExec->DoIO((struct IORequest *)ioreq) == 0) {
             BOOL ok = TRUE;
             for (int i = 0; i < 512; i++)
                 if (buf[i] != 0xA5) { ok = FALSE; break; }
-            printf("%s: Write/readback verify block 1\n", ok ? "PASS" : "FAIL");
+            report(ok, "Block 1 readback verify");
         } else {
-            printf("FAIL: Readback CMD_READ error %d\n", ioreq->io_Error);
+            report(FALSE, "Readback CMD_READ io_Error=%d", ioreq->io_Error);
         }
     } else {
-        printf("FAIL: CMD_WRITE error %d\n", ioreq->io_Error);
+        report(FALSE, "CMD_WRITE block 1 io_Error=%d", ioreq->io_Error);
     }
 
-    FreeVec(buf);
+    IExec->FreeVec(buf);
+
+    /* -------------------------------------------------------------- */
+    /* 8. 64 KiB bounce-buffer round-trip verify at offset 4 KiB       */
+    /* -------------------------------------------------------------- */
+    {
+        ULONG big_len = 64u * 1024u;
+        UBYTE *bigbuf = IExec->AllocVecTags(big_len,
+            AVT_Type,      MEMF_SHARED,
+            AVT_Alignment, 4096,
+            AVT_Clear,     0,
+            TAG_DONE);
+        if (!bigbuf) {
+            report(FALSE, "AllocVecTags 64 KiB");
+        } else {
+            /* Fill with a pseudo-random pattern keyed by byte index so
+             * any misalignment is caught. */
+            for (ULONG i = 0; i < big_len; i++)
+                bigbuf[i] = (UBYTE)((i * 131u + 7u) & 0xFF);
+
+            ioreq->io_Command = CMD_WRITE;
+            ioreq->io_Data    = bigbuf;
+            ioreq->io_Length  = big_len;
+            ioreq->io_Offset  = 4096;
+            if (IExec->DoIO((struct IORequest *)ioreq) == 0) {
+                ioreq->io_Command = CMD_UPDATE;
+                ioreq->io_Data    = NULL;
+                ioreq->io_Length  = 0;
+                ioreq->io_Offset  = 0;
+                (void)IExec->DoIO((struct IORequest *)ioreq);
+
+                memset(bigbuf, 0, big_len);
+                ioreq->io_Command = CMD_READ;
+                ioreq->io_Data    = bigbuf;
+                ioreq->io_Length  = big_len;
+                ioreq->io_Offset  = 4096;
+                if (IExec->DoIO((struct IORequest *)ioreq) == 0) {
+                    BOOL ok = TRUE;
+                    ULONG bad_at = 0;
+                    for (ULONG i = 0; i < big_len; i++) {
+                        UBYTE expected = (UBYTE)((i * 131u + 7u) & 0xFF);
+                        if (bigbuf[i] != expected) {
+                            ok = FALSE;
+                            bad_at = i;
+                            break;
+                        }
+                    }
+                    if (ok)
+                        report(TRUE, "64 KiB write/read round-trip verify");
+                    else
+                        report(FALSE, "64 KiB verify mismatch at offset %lu"
+                                      " (got 0x%02X)",
+                               bad_at, bigbuf[bad_at]);
+                } else {
+                    report(FALSE, "64 KiB CMD_READ io_Error=%d", ioreq->io_Error);
+                }
+            } else {
+                report(FALSE, "64 KiB CMD_WRITE io_Error=%d", ioreq->io_Error);
+            }
+            IExec->FreeVec(bigbuf);
+        }
+    }
+
+    /* -------------------------------------------------------------- */
+    /* 9. TD_READ64 at high offset (>4 GiB)                            */
+    /* -------------------------------------------------------------- */
+    if (true_total_bytes > (uint64)(5u * 1024u * 1024u) * 1024u) {
+        /* Pick an offset near the end of the device, aligned on a
+         * sector boundary.  Bytes 512 just before total give us a
+         * sector that exists and can be read safely. */
+        uint64 hi_offset = (true_total_bytes & ~((uint64)true_sector_size - 1))
+                         - (uint64)true_sector_size;
+        UBYTE *hbuf = IExec->AllocVecTags(true_sector_size,
+            AVT_Type,      MEMF_SHARED,
+            AVT_Alignment, true_sector_size,
+            AVT_Clear,     0,
+            TAG_DONE);
+        if (!hbuf) {
+            report(FALSE, "AllocVecTags for TD_READ64");
+        } else {
+            ioreq->io_Command = TD_READ64;
+            ioreq->io_Data    = hbuf;
+            ioreq->io_Length  = true_sector_size;
+            ioreq->io_Offset  = (ULONG)(hi_offset & 0xFFFFFFFFu);
+            ioreq->io_Actual  = (ULONG)(hi_offset >> 32);
+            if (IExec->DoIO((struct IORequest *)ioreq) == 0) {
+                report(TRUE, "TD_READ64 @ offset (hi:%lu lo:%lu)  last sector",
+                       (ULONG)(hi_offset >> 32),
+                       (ULONG)(hi_offset & 0xFFFFFFFFu));
+            } else {
+                report(FALSE, "TD_READ64 io_Error=%d", ioreq->io_Error);
+            }
+            IExec->FreeVec(hbuf);
+        }
+    } else {
+        printf("SKIP: TD_READ64 high-offset (namespace < 5 GiB)\n");
+    }
 
 done:
-    /* 7. CloseDevice */
-    CloseDevice((struct IORequest *)ioreq);
-    printf("PASS: CloseDevice\n");
+    IExec->CloseDevice((struct IORequest *)ioreq);
+    report(TRUE, "CloseDevice");
 
-    DeleteIORequest((struct IORequest *)ioreq);
-    DeleteMsgPort(port);
+    IExec->FreeSysObject(ASOT_IOREQUEST, ioreq);
+    IExec->FreeSysObject(ASOT_PORT, port);
 
-    printf("Test complete.\n");
-    return 0;
+    printf("----- test_nvme: %d passed, %d failed -----\n",
+           g_pass_count, g_fail_count);
+    return (g_fail_count == 0) ? 0 : 1;
 }

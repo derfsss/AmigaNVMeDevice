@@ -1,0 +1,196 @@
+Short:        Native NVMe block device driver for AmigaOS 4.1 FE
+Author:       Richard Gibbs
+Uploader:     Richard Gibbs
+Type:         driver/hardware
+Version:      1.61
+Architecture: ppc-amigaos
+
+
+DESCRIPTION
+===========
+
+nvme.device is a native AmigaOS 4.1 Final Edition block-device driver
+for NVMe controllers on PCIe.  It exposes NVMe namespaces as standard
+AmigaOS units that can be partitioned, mounted, and booted from just
+like any trackdisk-compatible device.
+
+One binary runs on every AmigaOS 4.1 FE platform whose PCIe bridge
+forwards CPU memory cycles:
+
+  * Pegasos II       (MV64361 bridge)
+  * Sam440ep         (AMCC 440EP)
+  * Sam460ex         (AMCC 460EX)
+  * X1000            (PA6T Nemo)
+  * X5000            (QorIQ P5020 / P5040)
+  * A1222 "Tabor"    (QorIQ P1022)
+  * AmigaOne 500
+  * QEMU Pegasos2    (default test target)
+
+The original AmigaOne XE / SE (Mai Logic Articia S) is NOT supported
+because that bridge does not forward CPU memory cycles to PCIe MMIO.
+The driver detects this at init time and aborts cleanly with a
+diagnostic message.
+
+Validated end-to-end on QEMU Pegasos2:
+  - Boots to DOS / Workbench
+  - Partitioned with Media Toolbox
+  - Formatted with SmartFilesystem (SFS/00)
+  - Benchmarked with AmigaDiskBench — sustained 265-279 MB/s
+    sequential, 196-225 MB/s random
+  - SMART data visible in AmigaDiskBench's SMART tab (real NVMe
+    telemetry translated into ATA attribute format)
+
+
+FEATURES
+========
+
+ - Full NVMe 1.4 controller init (admin queues, identify, per-unit
+   I/O SQ/CQ pair).
+ - Multi-controller: up to four NVMe devices on the PCIe bus, each
+   with up to eight namespaces (32 units total).
+ - Shared INTx interrupt handling with per-controller ISR and
+   automatic polling-mode fallback when MapInterrupt fails.
+ - 64 KiB pre-pinned bounce buffer per inflight slot with full
+   PRP1 / PRP2 / PRP-list support including multi-page transfers.
+ - MDTS chunking for transfers larger than the controller maximum.
+ - TD_READ64 / WRITE64 and every NSD 64-bit command.
+ - HD_SCSICMD synthesis:
+     * INQUIRY  (standard + VPD pages 0x00, 0x80, 0x83)
+     * READ CAPACITY (10)
+     * TEST UNIT READY
+     * ATA PASS-THROUGH (CDB 0x85 / 0xA1) → ATA SMART (0xB0)
+       with READ DATA (0xD0) and READ THRESHOLDS (0xD1)
+       sub-commands — satisfies AmigaDiskBench's SMART tab with
+       live NVMe telemetry.
+     * LOG SENSE (CDB 0x4D) pages 0x00 and 0x2F.
+ - Live statistics via NSCMD_NVME_GETSTATS (0xA100): byte counts,
+   latencies, per-path hit counts, error buckets, SMART/Health
+   log page refresh on demand.
+ - MMU cache-inhibit + guarded MMU attributes on BAR0 for correct
+   MMIO behaviour on real hardware.
+ - Boot-drive compatible (resident priority 0 matches
+   virtioscsi.device).
+ - Release build emits only the startup banner on the serial
+   console during normal operation.  Verbose trace lives in the
+   debug build which is drop-in compatible.
+
+
+ARCHIVE CONTENTS
+================
+
+  nvme.device            Release build — use this as your driver.
+  nvme.device.debug      Debug build — identical behaviour, full
+                         verbose serial-console trace.  Rename to
+                         nvme.device to swap it in for debugging.
+  test_nvme              Smoke-test program.  Exercises OpenDevice,
+                         INQUIRY, geometry, read, write, 64 KiB
+                         round-trip verify and TD_READ64 at a high
+                         offset.
+  nvme_stats             CLI monitor for the live statistics
+                         interface.  Usage:
+                           nvme_stats                one unit 0 snap
+                           nvme_stats 1              unit 1 snap
+                           nvme_stats -w 0 1         watch unit 0 1s
+                           nvme_stats -s             summary of all
+  nvme.readme            This file.
+  diskboot.config.sample Example diskboot.config entry for
+                         boot-drive use.
+  AutoInstall            Run from shell or double-click to install
+                         nvme.device into DEVS:.
+
+
+INSTALLATION
+============
+
+Standard install (runtime load from DEVS:):
+
+  1. Extract the archive anywhere.
+  2. Double-click the `AutoInstall` icon, or from shell:
+         execute AutoInstall
+  3. nvme.device is now in DEVS:.
+  4. Create a DOSDriver entry pointing at nvme.device in the usual
+     way (Mountlist / DOSDrivers), or let partition auto-mount pick
+     it up via mounter.library.
+
+
+Boot-drive install (Kickstart module):
+
+  1. Complete the standard install first.
+  2. Copy nvme.device into your system's Kickstart drawer:
+         copy DEVS:nvme.device Kickstart:nvme.device
+  3. Append this line to Kickstart:diskboot.config:
+         nvme.device 1 1
+     (The sample file diskboot.config.sample shows the format.)
+  4. Reboot.  nvme.device is now loaded before any disk is touched
+     and can host the boot partition.
+
+For QEMU Pegasos2 users: place nvme.device inside kickstart.zip's
+Kickstart/ drawer (rather than in DEVS: on the disk image), and
+add the diskboot.config entry to the same drawer.  See the project
+docs/nvme_boot_strategy.md for the full procedure.
+
+
+DEBUG VS RELEASE BUILDS
+=======================
+
+Both binaries are wire-compatible; they export the same interface
+and behave identically at runtime.  The differences are:
+
+  nvme.device         Release: only the startup banner prints.
+                      Every DPRINTF / trace line is compiled out.
+  nvme.device.debug   Debug: full verbose trace — every admin
+                      command, every I/O submission and harvest,
+                      DMA flag details, stats counter increments,
+                      leak-tracker report at Expunge time.
+
+Both emit the always-on startup banner:
+
+  [nvme.device] v1.61 build DD.MM.YYYY HH:MM:SS
+
+so you can always tell which build is loaded.  To switch flavours,
+rename the relevant file to nvme.device in DEVS: (or Kickstart:).
+
+
+SMART TELEMETRY
+===============
+
+The driver exposes NVMe health data through two paths:
+
+  * NSCMD_NVME_GETSTATS (0xA100) — a native versioned snapshot that
+    includes every NVMe SMART field plus live driver counters.  The
+    bundled nvme_stats tool reads this directly.
+
+  * HD_SCSICMD with ATA PASS-THROUGH (CDB 0x85 or 0xA1), ATA cmd
+    0xB0, feature 0xD0 / 0xD1 — returns a 512-byte ATA SMART data
+    block synthesized live from NVMe Log Page 0x02.  Works with
+    AmigaDiskBench unmodified.
+
+Attributes populated in the ATA synthesis:
+
+    9   Power-On Hours
+   12   Power-Cycle Count
+  192   Unsafe Shutdowns
+  194   Composite Temperature °C  (raw + normalised)
+  196   Media & Data Integrity Errors
+  231   SSD Life Left / Available Spare %
+  233   Media Wearout Indicator
+
+The driver caches the SMART read and only issues a fresh admin
+Get Log Page command every 30 seconds, so rapid polling does not
+thrash the controller.
+
+
+SUPPORT
+=======
+
+Source: https://github.com/rgibbs-code/AmigaNVMeDevice
+Issues: via the project's issue tracker on GitHub.
+
+See the in-archive nvme.readme or the docs/ directory in the source
+repository for the full architecture reference and platform notes.
+
+
+LICENCE
+=======
+
+Distributed under the terms of the included LICENSE file.
