@@ -183,7 +183,7 @@ thrash the controller.
 SUPPORT
 =======
 
-Source: https://github.com/rgibbs-code/AmigaNVMeDevice
+Source: https://github.com/derfsss/AmigaNVMeDevice
 Issues: via the project's issue tracker on GitHub.
 
 See the in-archive nvme.readme or the docs/ directory in the source
