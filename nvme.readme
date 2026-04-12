@@ -2,7 +2,7 @@ Short:        Native NVMe block device driver for AmigaOS 4.1 FE
 Author:       Richard Gibbs
 Uploader:     Richard Gibbs
 Type:         driver/hardware
-Version:      1.61
+Version:      1.65
 Architecture: ppc-amigaos
 
 
@@ -52,6 +52,17 @@ FEATURES
    automatic polling-mode fallback when MapInterrupt fails.
  - 64 KiB pre-pinned bounce buffer per inflight slot with full
    PRP1 / PRP2 / PRP-list support including multi-page transfers.
+ - Alignment-aware DMA path selection (v1.62): bounce is used for
+   small or unaligned transfers; aligned medium-and-up transfers
+   take the direct-DMA path and skip the memcpy.
+ - Pre-allocated DMAEntry pool per inflight slot (v1.62): the
+   direct-DMA path reuses these instead of allocating per I/O.
+ - Batched SQ doorbell writes (v1.62): a burst of N queued I/Os
+   costs a single doorbell write instead of N.
+ - IExec->CopyMem on bounce path (v1.65): replaces compat.c's
+   byte-by-byte memcpy; measurable win on 4 KiB - 64 KiB writes.
+ - MDTS soft-cap 2 MiB (v1.65): larger single-command capacity
+   when the controller advertises MDTS=0.
  - MDTS chunking for transfers larger than the controller maximum.
  - TD_READ64 / WRITE64 and every NSD 64-bit command.
  - HD_SCSICMD synthesis:
@@ -145,7 +156,7 @@ and behave identically at runtime.  The differences are:
 
 Both emit the always-on startup banner:
 
-  [nvme.device] v1.61 build DD.MM.YYYY HH:MM:SS
+  [nvme.device] v1.65 build DD.MM.YYYY HH:MM:SS
 
 so you can always tell which build is loaded.  To switch flavours,
 rename the relevant file to nvme.device in DEVS: (or Kickstart:).

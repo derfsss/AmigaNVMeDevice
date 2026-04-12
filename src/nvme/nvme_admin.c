@@ -156,12 +156,27 @@ BOOL NVMe_IdentifyController(struct NVMeController *ctrl)
     const char *mn = ctrl->model;
     const char *fr = ctrl->fw_rev;
 
-    /* MDTS=0 → unlimited (we cap at 1 MiB for sanity);
-     * MDTS>0 → max transfer = 2^MDTS × page_size bytes. */
-    if (id->mdts > 0)
-        ctrl->max_transfer_bytes = (1u << id->mdts) * ctrl->page_size;
-    else
-        ctrl->max_transfer_bytes = 1024u * 1024u;
+    /* MDTS=0 → unlimited; cap at a local sanity maximum to bound
+     * per-unit memory (bounce, PRP-list, DMAEntry pools all scale
+     * with this).  MDTS>0 → max transfer = 2^MDTS × page_size bytes.
+     *
+     * Local cap picked at 2 MiB to match our single-PRP-list-page
+     * capacity: one 4 KiB PRP-list page holds 4096/8 = 512 entries,
+     * each covering page_size = 4 KiB, for 512 × 4 KiB = 2 MiB of
+     * contiguous coverage past PRP1.  Going above 2 MiB would need
+     * a chained PRP-list-of-PRP-lists which we don't implement.
+     *
+     * Raising from 1 MiB to 2 MiB lets filesystem readahead / backup
+     * tools issue double-size commands as single NVMe operations,
+     * halving the command-count overhead for those workloads. */
+    if (id->mdts > 0) {
+        ULONG mdts_bytes = (1u << id->mdts) * ctrl->page_size;
+        ULONG sanity_cap = 2u * 1024u * 1024u;
+        ctrl->max_transfer_bytes = (mdts_bytes < sanity_cap) ? mdts_bytes
+                                                             : sanity_cap;
+    } else {
+        ctrl->max_transfer_bytes = 2u * 1024u * 1024u;
+    }
 
     DLOG(IExec, "[nvme.device:admin] ctrl %lu: \"%s\" FW \"%s\""
                 " MDTS=%u max_xfer=%lu\n",

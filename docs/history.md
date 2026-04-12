@@ -1,5 +1,187 @@
 # nvme.device — Changelog
 
+## Session 10 — 2026-04-12 (late evening)
+
+### v1.63 → v1.65 — second perf sweep + learnings from two dead-ends
+
+After Session 9 shipped v1.62's three structural changes (alignment-aware
+bounce selection, DMAEntry pool, doorbell batching), a cross-device
+benchmark vs `virtioscsi.device` suggested nvme.device was still 1.3–6.7×
+slower at 128 KiB+.  Architectural deep-dive of virtioscsi revealed that
+most of its tricks were **already in our driver** after v1.62; the one
+clear remaining gap was the CPU memcpy through the bounce.
+
+Five candidate optimisations were designed and implemented as v1.63:
+
+1. **`IExec->CopyMem` in the bounce path** — replaces compat.c's byte-by-
+   byte memcpy (we build `-nostartfiles` so newlib's memcpy isn't linked).
+   Exec's CopyMem is the canonical optimised block copy; fits the hot
+   path (write Submit and read Harvest) in ~4 lines.
+
+2. **`NVME_MAX_INFLIGHT` 16 → 32** — bigger pipeline depth for multi-
+   client bursts.
+
+3. **User-buffer DMA pin cache** — speculative one-slot cache keeping
+   a `StartDMA` pin alive across I/Os so repeated use of the same user
+   buffer wouldn't pay StartDMA/EndDMA every time.
+
+4. **Hybrid-poll window** — 512-iter spin-Harvest after the SQ doorbell
+   ring to catch fast completions inline before falling into the outer
+   yield-poll.
+
+5. **MDTS soft-cap 1 MiB → 2 MiB** — lifts the synthetic cap when MDTS=0,
+   bounded by our single-PRP-list-page capacity (512 × 4 KiB = 2 MiB).
+
+#### v1.63 crashed on first test
+
+AmigaDiskBench's Sprinter-1-MiB test DSI-faulted inside
+`CacheClearE`'s `dcbi` loop — DAR pointed at an unmapped user page.
+Root cause: **change 3 (pin cache) is fundamentally unsafe on AmigaOS
+4**.  `StartDMA`/`EndDMA` are *cache-maintenance* operations, not
+page-pinning — the OS exposes no signal when the caller frees their
+buffer.  ADB moved from the 256 KiB test to the 1 MiB test, freed the
+256 KiB buffer, and our next `dma_cache_evict → EndDMA(freed_pages)`
+ran `dcbi` across unmapped memory.
+
+Lesson, saved as a memory:  any design that tries to hold a `StartDMA`
+pin across I/O boundaries is a non-starter on this OS.  The DMAEntry
+*pool* works (it pre-allocates `struct DMAEntry` arrays, not buffer
+pins); the pin *cache* doesn't.
+
+v1.64 shipped with change 3 reverted but 1, 2, 4, 5 kept.
+
+#### v1.64 passed correctness but read performance regressed badly
+
+Re-run of the benchmark showed SequentialRead −13 % and Random4KRead
+−11 % vs v1.62, wiping out the read wins we'd already banked.  Net
+across all suites was slightly worse than baseline despite clear wins
+on HeavyLifter (+8 %).
+
+Root cause: **change 4 (hybrid-poll) is actively harmful under QEMU TCG**.
+QEMU runs guest CPU and device emulation on a single cooperative
+thread.  The spin-Harvest after the doorbell ring monopolises guest
+CPU exactly during the window when QEMU needs it to progress the NVMe
+DMA.  `Forbid()`/`Permit()` in the outer yield-poll loop gives QEMU
+that CPU; hybrid-poll delays it by up to 512 iterations.  The worst
+regressions were on read paths where completion latency dominates and
+QEMU CPU starvation is most painful.
+
+Secondary observation: **change 2 (NVME_MAX_INFLIGHT 32) did nothing**
+for single-client AmigaDiskBench workloads.  The event loop never had
+more than a handful of messages queued at once.  Net cost was
+doubling the per-unit bounce + pool memory footprint for no
+observable benefit.
+
+Both change 2 and change 4 were reverted.  v1.65 kept only change 1
+(CopyMem) and change 5 (MDTS cap).
+
+#### v1.65 benchmark result — six of seven suites up +7 %–+12 % vs v1.61
+
+| suite          | v1.61 → v1.65 total | Δ |
+|---|---:|---:|
+| HeavyLifter    | 442 → 480  | **+8.6 %**  |
+| Legacy         | 428 → 473  | **+10.5 %** |
+| Sequential     | 808 → 792  | −2.1 %      |
+| Random4K       | 1171 → 1299 | **+11.0 %** |
+| SequentialRead | 1377 → 1482 | **+7.6 %**  |
+| Random4KRead   | 1106 → 1243 | **+12.3 %** |
+| MixedRW70/30   | 1164 → 1277 | **+9.7 %**  |
+
+Best single-cell wins (vs v1.61):
+
+- Random4K 64 K: **85 → 117 MB/s (+37 %)**
+- Random4KRead 64 K: 96 → 120 MB/s (+25 %)
+- SequentialRead 64 K: 128 → 159 MB/s (+24 %)
+- Legacy 1 M: 104 → 114 MB/s (+9 %)
+
+The one remaining regression is Sequential writes at 16–64 KiB —
+aligned multi-page transfers on that suite take the direct-DMA path,
+which pays a write-side cache flush (`dcbf + sync`) in `StartDMA` that
+turns out to be expensive on fresh CPU-dirtied lines.  HeavyLifter
+and Legacy tolerate this fine (warm-buffer pattern); Sequential
+doesn't.  A write-side asymmetric heuristic could recover it but
+hasn't been implemented — the −2 % suite-total cost is acceptable
+against +9 % gains everywhere else.
+
+### Final v1.65 changeset on top of v1.61
+
+Kept from v1.62 (Session 7's performance sweep):
+
+- Alignment-aware bounce selection (`should_use_bounce()` in `nvme_io.c`).
+- Pre-allocated DMAEntry pool per inflight slot.
+- `NVMeIO_SubmitNoRing` + `NVMeIO_RingSQ` split with event-loop doorbell
+  batching.
+
+New in v1.65:
+
+- `IExec->CopyMem` on the bounce hot path, replacing `compat.c memcpy`.
+- MDTS soft-cap raised 1 MiB → 2 MiB (matches single-PRP-list-page
+  capacity).
+
+Version bump 1.61 → 1.65, build stamp refreshed.
+
+## Session 9 — 2026-04-12 (evening)
+
+### v1.62 — Performance: alignment-aware DMA path, DMAEntry pool, SQ doorbell batching
+
+Driven by the cross-device AmigaDiskBench session in `nvme_adb2.txt`
+(RAM Disk vs `nvme.device` vs `virtioscsi.device`).  At block sizes
+≤ 64 KiB the two drivers were within 10 % of each other; at 128 KiB
+and above `virtioscsi.device` pulled 1.3–6.7× ahead depending on the
+test.  Root-cause analysis identified three architectural causes, all
+addressed in this revision:
+
+**1. Alignment-aware bounce selection.**  The previous decision was a
+straight `byte_length ≤ NVME_BOUNCE_SIZE → bounce`, which forced every
+transfer up to 64 KiB through a full-size memcpy even when the user
+buffer was page-aligned and would have been trivially DMA-able.  The
+new heuristic in `nvme_io.c:should_use_bounce` keeps bounce for small
+transfers (< `NVME_DIRECT_MIN_PAGES × page_size`, nominally 2 pages)
+and for unaligned buffers, but sends aligned medium transfers through
+direct DMA — skipping the memcpy entirely.
+
+**2. Pre-allocated DMAEntry pool.**  The direct-DMA path was calling
+`AllocSysObjectTags(ASOT_DMAENTRY)` and `FreeSysObject` on every I/O.
+Every unit now owns one DMAEntry array per inflight slot, sized for
+the controller's worst-case fragmentation
+(`max_transfer_bytes / page_size + 1` entries).  `NVMeIO_Submit`
+reuses these in place of per-I/O allocation; a per-I/O fallback is
+retained for the vanishingly-rare case where an I/O's StartDMA
+reports more fragments than the pool can hold.  Pool lifetime is tied
+to `UnitTask_Start`/`UnitTask_Shutdown`, symmetrical with the bounce
+buffers and PRP-list pages.
+
+**3. SQ doorbell batching.**  `NVMeIO_Submit` was split into
+`NVMeIO_SubmitNoRing` (reserve slot + build SQE + advance shadow tail)
+and `NVMeIO_RingSQ` (publish the tail to the device).  The unit task's
+event loop snapshots the SQ tail before draining the message port,
+dispatches every queued message via the no-ring primitive, and then
+rings exactly once at the end.  For a burst of N user I/Os the device
+now sees one doorbell write instead of N.  Single-request workloads
+(most of the AmigaDiskBench suites) are unchanged; multi-client
+bursts see the saving.  `NVMeIO_Submit` is retained as a convenience
+wrapper for paths that want immediate doorbell visibility (Flush, the
+chunked path's per-chunk poll).
+
+Additional hygiene in the same commit:
+
+- `struct NVMeInflight` now snapshots the user-buffer pointer and
+  length at Submit time.  The Harvest copy-back uses the snapshot
+  rather than re-reading `req->io_Data` / `req->io_Length`, which
+  makes the bounce path safe against callers that mutate their
+  `IORequest` between Submit and Harvest — e.g. the MDTS chunked path.
+- The direct-path "which flavour is this DMAEntry array" marker is
+  encoded in the top bit of `inf->dma_flags`; the extraction in
+  `NVMeIO_Harvest` masks it off before calling `EndDMA`.
+- Version bump 1.61 → 1.62, build date stamp refreshed by the
+  Makefile on every compile.
+
+Validation plan for this revision: re-run the full AmigaDiskBench
+suite against `nvme.device.debug`, compare NVME-column numbers
+against the v1.61 reference in `nvme_adb2.txt`.  Expected wins at
+8–64 KiB block sizes (memcpy now skipped on aligned transfers) and
+at 128 KiB–1 MiB (DMAEntry pool eliminates AllocSysObject per I/O).
+
 ## Session 8 — 2026-04-12 (late)
 
 ### Post-modernization bug-fix sweep — v1.55 → v1.61

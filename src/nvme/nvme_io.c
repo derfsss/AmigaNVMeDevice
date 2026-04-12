@@ -3,15 +3,29 @@
  *
  * The I/O hot path for every namespace.  A unit has NVME_MAX_INFLIGHT
  * pipelined command slots, each with its own pre-allocated bounce
- * buffer and PRP list page.  NVMeIO_Submit picks a free slot, builds
- * the SQE (opcode / PRP1 / PRP2 / LBA / NLB), and rings the doorbell.
- * NVMeIO_Harvest is the symmetric consumer: drain CQEs, match CID to
- * slot, translate status, reply the held IORequest, and advance the
- * CQ-head doorbell.
+ * buffer, PRP list page, and DMAEntry pool.  Submission is split into
+ * two primitives so that callers can batch:
  *
- * Transfer strategy depends on size:
- *   - size ≤ NVME_BOUNCE_SIZE  → CPU copies into bounce, DMA cached
- *   - size > NVME_BOUNCE_SIZE  → StartDMA on the user buffer itself
+ *   NVMeIO_SubmitNoRing — reserve a slot, build the SQE, advance the
+ *                         shadow SQ tail.  Does NOT write the doorbell.
+ *   NVMeIO_RingSQ       — publish the shadow tail to the controller.
+ *
+ * NVMeIO_Submit is a convenience wrapper that does both back-to-back.
+ *
+ * NVMeIO_Harvest drains the CQ: match CID to slot, translate status,
+ * reply the held IORequest, advance the CQ-head doorbell.
+ *
+ * Transfer strategy — see should_use_bounce() below:
+ *
+ *   - Bounce path — small transfers (≤ a few pages) or unaligned user
+ *     buffers.  CPU memcpy into the slot's pre-pinned bounce, no per-
+ *     I/O StartDMA.  Fast for cases where the memcpy cost is below
+ *     StartDMA's fixed overhead.
+ *
+ *   - Direct path — aligned multi-page transfers and everything above
+ *     NVME_BOUNCE_SIZE.  StartDMA + GetDMAList on the user buffer,
+ *     reusing the slot's pre-allocated DMAEntry pool (no per-I/O
+ *     AllocSysObject).  Skips the memcpy entirely.
  *
  * PRP construction follows NVMe 1.4 §4.3 rules — see nvme_io.h for the
  * one / two / >two-page branching table.
@@ -57,13 +71,79 @@ static LONG find_free_slot(struct NVMeUnit *unit)
     return -1;
 }
 
-/* Build and submit a read or write SQE for the given IOStdReq. */
-LONG NVMeIO_Submit(struct NVMeBase *devBase, struct NVMeUnit *unit,
-                   struct IOStdReq *ioreq, BOOL is_write)
+/*
+ * Pick the DMA path for this transfer.
+ *
+ * The bounce path amortises a persistent DMA pin: at submit time we
+ * only pay a memcpy between the user buffer and a pre-pinned bounce
+ * (O(byte_length) CPU cost, typically ~200 MB/s on PPC G3/G4).
+ *
+ * The direct path skips the memcpy but pays StartDMA/GetDMAList/EndDMA
+ * per I/O.  On AmigaOS 4 those calls include cache-maintenance work
+ * proportional to the buffer size, but include a non-trivial fixed
+ * setup cost that tends to dominate for tiny transfers.
+ *
+ * Heuristic:
+ *   - byte_length > NVME_BOUNCE_SIZE      → direct (must — the bounce
+ *                                           is too small to hold it).
+ *   - byte_length < NVME_DIRECT_MIN_SIZE  → bounce (the fixed setup
+ *                                           cost of StartDMA dominates
+ *                                           — memcpy is cheaper here).
+ *   - unaligned buffer                    → bounce (simpler PRP list
+ *                                           from a single contiguous
+ *                                           allocation; also sidesteps
+ *                                           the StartDMA/GetDMAList
+ *                                           scatter-gather walk for
+ *                                           awkward alignments).
+ *   - aligned medium transfer             → direct (the memcpy would
+ *                                           cost more than StartDMA).
+ *
+ * "Aligned" here means page-aligned — so the first physical page of
+ * the direct-path transfer starts at offset 0 within its page, which
+ * maximally simplifies PRP1 / PRP2 accounting.
+ */
+static BOOL should_use_bounce(ULONG byte_length, APTR data_virt,
+                              ULONG page_size)
+{
+    /* Must-direct: doesn't fit in a single bounce slot. */
+    if (byte_length > NVME_BOUNCE_SIZE)
+        return FALSE;
+
+    /* Must-bounce: below the crossover, the memcpy is cheaper than
+     * the fixed per-I/O cost of the direct path. */
+    ULONG min_direct = NVME_DIRECT_MIN_PAGES * page_size;
+    if (byte_length < min_direct)
+        return TRUE;
+
+    /* Medium range — bounce only if the buffer isn't page-aligned.
+     * Aligned transfers can go direct and skip the memcpy. */
+    ULONG page_offset = ((ULONG)data_virt) & (page_size - 1);
+    return (page_offset != 0);
+}
+
+/*
+ * NVMeIO_RingSQ — publish the current shadow tail to the device.
+ * Idempotent; the doorbell register tolerates redundant writes of the
+ * same value.
+ */
+void NVMeIO_RingSQ(struct NVMeUnit *unit)
+{
+    struct NVMeController *ctrl = unit->ctrl;
+    NVME_W32_DB(ctrl->pciDevice, ctrl->iobase,
+                NVME_SQ_TAIL_DB(unit->queue_id, ctrl->cap_dstrd),
+                unit->io_sq_tail);
+}
+
+
+/*
+ * NVMeIO_SubmitNoRing — reserve a slot and build the SQE without
+ * ringing the SQ doorbell.  Callers batch-rings via NVMeIO_RingSQ.
+ */
+LONG NVMeIO_SubmitNoRing(struct NVMeBase *devBase, struct NVMeUnit *unit,
+                         struct IOStdReq *ioreq, BOOL is_write)
 {
     struct NVMeController *ctrl  = unit->ctrl;
     struct ExecIFace      *IExec = devBase->IExec;
-    ULONG                  base  = ctrl->iobase;
 
     LONG slot = find_free_slot(unit);
     if (slot < 0)
@@ -94,20 +174,40 @@ LONG NVMeIO_Submit(struct NVMeBase *devBase, struct NVMeUnit *unit,
     inf->ioreq    = ioreq;
     inf->is_write = is_write;
     inf->use_bounce = FALSE;
+    inf->dma_list   = NULL;
+    inf->bounce_user_buf = NULL;
+    inf->bounce_user_len = 0;
 
     APTR   data_virt = ioreq->io_Data;
     ULONG  prp1_phys, prp2_phys;
 
-    /* Choose bounce vs. direct DMA */
-    if (byte_length <= NVME_BOUNCE_SIZE) {
+    /* Pick the DMA path.  Alignment-aware — see should_use_bounce(). */
+    if (should_use_bounce(byte_length, data_virt, ctrl->page_size)) {
         unit->stats.bounce_hits++;
         inf->use_bounce = TRUE;
+        /* Snapshot the user-buffer destination so Harvest's copy-back
+         * works even if the caller later mutates its IORequest (the
+         * MDTS chunking path in unit_task.c does exactly this). */
+        inf->bounce_user_buf = data_virt;
+        inf->bounce_user_len = byte_length;
+        /* NB: we deliberately do NOT use C's memcpy() here or in
+         * Harvest.  compat.c's fallback memcpy is a byte-by-byte loop
+         * (we build with -nostartfiles so newlib isn't linked).  That
+         * loop tops out at ~200 MB/s on PPC G3 / QEMU; for a 64 KiB
+         * bounce transfer it dominates end-to-end latency.  Exec's
+         * CopyMem is the canonical optimised block-copy — word- or
+         * doubleword-wide inside, with byte-wise fall-off for
+         * misaligned tails.  Argument order is Amiga-style: src, dst,
+         * length.  IOS 4 also exposes CopyMemQuick (requires mutual
+         * 4-byte alignment of source, destination, and length); we
+         * stick with the general-purpose CopyMem because the user
+         * buffer alignment is caller-supplied and not guaranteed. */
         /* The bounce buffer is permanently DMA-pinned (cache-inhibited)
          * from UnitTask_Start — no CacheClearE is needed in either
          * direction.  Writes go RAM-coherent immediately; reads return
          * the data the device DMAs in without any cache to invalidate. */
         if (is_write)
-            memcpy(unit->bounce_bufs[slot], data_virt, byte_length);
+            IExec->CopyMem(data_virt, unit->bounce_bufs[slot], byte_length);
 
         prp1_phys = unit->bounce_phys[slot];
 
@@ -161,28 +261,66 @@ LONG NVMeIO_Submit(struct NVMeBase *devBase, struct NVMeUnit *unit,
         }
     } else {
         unit->stats.direct_dma_hits++;
-        /* Direct DMA: StartDMA on user buffer
-         * DMA_ReadFromRAM = device reads from RAM (write command)
-         * 0               = device writes to RAM (read command)   */
+        /* Direct DMA — StartDMA on the user buffer itself.
+         *   DMA_ReadFromRAM = device reads from RAM (write command)
+         *   0               = device writes to RAM (read command)
+         *
+         * We reuse the slot's pre-allocated DMAEntry pool whenever the
+         * reported entry count fits; a per-I/O AllocSysObjectTags call
+         * is used as a safety fallback for the rare case where the user
+         * buffer is so fragmented that it exceeds dma_entry_pool_capacity.
+         * `dma_list_is_pool` is encoded in the top bit of dma_flags so
+         * Harvest knows whether to FreeSysObject.  DMA_ReadFromRAM is
+         * bit 3 so the upper bits are free to claim.
+         *
+         * Note: we deliberately do NOT cache StartDMA pins across I/Os
+         * (the "speculative pin cache" experiment in the v1.63 prototype
+         * is unsafe — StartDMA/EndDMA on AmigaOS 4 is cache-maintenance,
+         * not page-pinning, and the OS gives us no way to detect when
+         * the caller frees their buffer between submissions.  Holding a
+         * cached pin across a buffer-free crashes inside CacheClearE's
+         * `dcbi` loop on eviction).  Per-I/O StartDMA/EndDMA is the
+         * correct contract for this OS. */
         ULONG flags = is_write ? DMA_ReadFromRAM : 0;
         ULONG entries = IExec->StartDMA(data_virt, byte_length, flags);
-        NVME_LEAK_INC(nvme_leak_dma);
-        inf->dma_list = IExec->AllocSysObjectTags(ASOT_DMAENTRY,
-            ASODMAE_NumEntries, entries, TAG_DONE);
-        if (!inf->dma_list) {
-            IExec->EndDMA(data_virt, byte_length, flags);
-            NVME_LEAK_DEC(nvme_leak_dma);
+        if (entries == 0) {
+            /* StartDMA refused — can't DMA this buffer.  Leave the slot
+             * free and surface a clean error. */
             inf->ioreq = NULL;
             ioreq->io_Error = IOERR_ABORTED;
             return -3;
         }
-        NVME_LEAK_INC(nvme_leak_dmaentry);
-        IExec->GetDMAList(data_virt, byte_length, flags, inf->dma_list);
+        NVME_LEAK_INC(nvme_leak_dma);
+
+        struct DMAEntry *dma_list = NULL;
+        BOOL dma_list_is_pool = FALSE;
+
+        if (entries <= unit->dma_entry_pool_capacity &&
+            unit->dma_entry_pool[slot] != NULL) {
+            /* Fast path — reuse the pre-allocated pool. */
+            dma_list         = unit->dma_entry_pool[slot];
+            dma_list_is_pool = TRUE;
+        } else {
+            /* Overflow or pool unavailable — fall back to per-I/O alloc. */
+            dma_list = IExec->AllocSysObjectTags(ASOT_DMAENTRY,
+                ASODMAE_NumEntries, entries, TAG_DONE);
+            if (!dma_list) {
+                IExec->EndDMA(data_virt, byte_length, flags);
+                NVME_LEAK_DEC(nvme_leak_dma);
+                inf->ioreq = NULL;
+                ioreq->io_Error = IOERR_ABORTED;
+                return -3;
+            }
+            NVME_LEAK_INC(nvme_leak_dmaentry);
+        }
+
+        IExec->GetDMAList(data_virt, byte_length, flags, dma_list);
+        inf->dma_list    = dma_list;
+        inf->dma_flags   = flags | (dma_list_is_pool ? 0x80000000u : 0u);
         inf->dma_buf     = data_virt;
-        inf->dma_phys    = (ULONG)inf->dma_list[0].PhysicalAddress;
+        inf->dma_phys    = (ULONG)dma_list[0].PhysicalAddress;
         inf->dma_size    = byte_length;
         inf->dma_entries = entries;
-        inf->dma_flags   = flags;
 
         prp1_phys = inf->dma_phys;
 
@@ -236,7 +374,7 @@ LONG NVMeIO_Submit(struct NVMeBase *devBase, struct NVMeUnit *unit,
             ULONG  global_off       = 0;   /* bytes consumed so far */
             BOOL   overflow         = FALSE;
 
-            for (ULONG e = 0; e < entries; e++) {
+            for (ULONG e = 0; e < inf->dma_entries; e++) {
                 ULONG ebase     = (ULONG)inf->dma_list[e].PhysicalAddress;
                 ULONG elen      = (ULONG)inf->dma_list[e].BlockLength;
                 ULONG entry_end = global_off + elen;
@@ -275,8 +413,12 @@ LONG NVMeIO_Submit(struct NVMeBase *devBase, struct NVMeUnit *unit,
                         byte_length, max_prp_entries);
                 IExec->EndDMA(data_virt, byte_length, flags);
                 NVME_LEAK_DEC(nvme_leak_dma);
-                IExec->FreeSysObject(ASOT_DMAENTRY, inf->dma_list);
-                NVME_LEAK_DEC(nvme_leak_dmaentry);
+                /* Only free the DMAEntry array if this I/O owned it —
+                 * the slot's pre-allocated pool must survive. */
+                if (!dma_list_is_pool) {
+                    IExec->FreeSysObject(ASOT_DMAENTRY, inf->dma_list);
+                    NVME_LEAK_DEC(nvme_leak_dmaentry);
+                }
                 inf->dma_list = NULL;
                 inf->ioreq    = NULL;
                 ioreq->io_Error = IOERR_BADLENGTH;
@@ -336,20 +478,36 @@ LONG NVMeIO_Submit(struct NVMeBase *devBase, struct NVMeUnit *unit,
     if (unit->stats.inflight_current > unit->stats.inflight_peak)
         unit->stats.inflight_peak = unit->stats.inflight_current;
 
-    /* Advance SQ tail and ring doorbell */
+    /* Advance the shadow SQ tail.  The caller is responsible for
+     * publishing it to the device via NVMeIO_RingSQ — we deliberately
+     * do not ring here so that bursts of submissions can share a
+     * single doorbell write. */
     unit->io_sq_tail = (unit->io_sq_tail + 1) % unit->queue_depth;
-    NVME_W32_DB(ctrl->pciDevice, base, NVME_SQ_TAIL_DB(unit->queue_id, ctrl->cap_dstrd),
-                unit->io_sq_tail);
 
     return 0; /* submitted; Harvest will ReplyMsg when done */
+}
+
+/*
+ * NVMeIO_Submit — convenience wrapper: submit + ring.
+ *
+ * Kept for callers that do not benefit from batching (single-shot
+ * dispatch, chunked path that polls per chunk).  The event loop uses
+ * NVMeIO_SubmitNoRing + a trailing NVMeIO_RingSQ so that a burst of
+ * queued messages pays only one doorbell write.
+ */
+LONG NVMeIO_Submit(struct NVMeBase *devBase, struct NVMeUnit *unit,
+                   struct IOStdReq *ioreq, BOOL is_write)
+{
+    LONG rc = NVMeIO_SubmitNoRing(devBase, unit, ioreq, is_write);
+    if (rc == 0)
+        NVMeIO_RingSQ(unit);
+    return rc;
 }
 
 LONG NVMeIO_Flush(struct NVMeBase *devBase, struct NVMeUnit *unit,
                   struct IOStdReq *ioreq)
 {
-    struct NVMeController *ctrl  = unit->ctrl;
-    struct ExecIFace      *IExec = devBase->IExec;
-    ULONG                  base  = ctrl->iobase;
+    struct ExecIFace *IExec = devBase->IExec;
 
     LONG slot = find_free_slot(unit);
     if (slot < 0) {
@@ -358,11 +516,14 @@ LONG NVMeIO_Flush(struct NVMeBase *devBase, struct NVMeUnit *unit,
     }
 
     UWORD cid = (UWORD)(slot + 1);
-    unit->inflight[slot].ioreq    = ioreq;
-    unit->inflight[slot].cmd_id   = cid;
-    unit->inflight[slot].is_write = FALSE;
-    unit->inflight[slot].use_bounce = FALSE;
-    unit->inflight[slot].dma_list   = NULL;
+    struct NVMeInflight *inf = &unit->inflight[slot];
+    inf->ioreq           = ioreq;
+    inf->cmd_id          = cid;
+    inf->is_write        = FALSE;
+    inf->use_bounce      = FALSE;
+    inf->dma_list        = NULL;
+    inf->bounce_user_buf = NULL;
+    inf->bounce_user_len = 0;
 
     struct nvme_sqe sqe_flush;
     memset(&sqe_flush, 0, sizeof(sqe_flush));
@@ -377,8 +538,8 @@ LONG NVMeIO_Flush(struct NVMeBase *devBase, struct NVMeUnit *unit,
 
     {
         uint64 tbr = nvme_read_tbr();
-        unit->inflight[slot].submit_ticks_hi = (uint32)(tbr >> 32);
-        unit->inflight[slot].submit_ticks_lo = (uint32)(tbr & 0xFFFFFFFFu);
+        inf->submit_ticks_hi = (uint32)(tbr >> 32);
+        inf->submit_ticks_lo = (uint32)(tbr & 0xFFFFFFFFu);
     }
     unit->stats.flushes++;
     unit->stats.inflight_current++;
@@ -386,8 +547,10 @@ LONG NVMeIO_Flush(struct NVMeBase *devBase, struct NVMeUnit *unit,
         unit->stats.inflight_peak = unit->stats.inflight_current;
 
     unit->io_sq_tail = (unit->io_sq_tail + 1) % unit->queue_depth;
-    NVME_W32_DB(ctrl->pciDevice, base, NVME_SQ_TAIL_DB(unit->queue_id, ctrl->cap_dstrd),
-                unit->io_sq_tail);
+    /* Flush is a control command — caller expects it to hit the wire
+     * immediately, so ring the doorbell directly here rather than
+     * asking the caller to chase a ring-after. */
+    NVMeIO_RingSQ(unit);
     return 0;
 }
 
@@ -472,15 +635,30 @@ void NVMeIO_Harvest(struct NVMeBase *devBase, struct NVMeUnit *unit)
 
         /* Clean up DMA / bounce — only copy back on a clean read.  The
          * bounce buffer is cache-inhibited so no CacheClearE is needed
-         * before the memcpy. */
+         * before the memcpy.  Copy-back uses the Submit-time snapshot
+         * so a caller that has since mutated its IORequest (the MDTS
+         * chunking path does this) still targets the correct bytes. */
         if (inf->use_bounce) {
-            if (!inf->is_write && ioerr == 0)
-                memcpy(req->io_Data, unit->bounce_bufs[slot], req->io_Length);
+            /* Read-side copy-back uses Exec's CopyMem (not the compat.c
+             * byte-by-byte memcpy) to keep bounce-path latency low;
+             * see the rationale next to the write-side copy in Submit. */
+            if (!inf->is_write && ioerr == 0 && inf->bounce_user_buf)
+                IExec->CopyMem(unit->bounce_bufs[slot],
+                               inf->bounce_user_buf,
+                               inf->bounce_user_len);
         } else if (inf->dma_list) {
-            IExec->EndDMA(inf->dma_buf, inf->dma_size, inf->dma_flags);
+            /* Extract the original DMA direction flags and the pool-vs-
+             * alloc marker written by Submit (top bit of dma_flags).
+             * EndDMA must see the unmodified direction flags it started
+             * with; FreeSysObject must run only for per-I/O allocations. */
+            BOOL dma_list_is_pool = (inf->dma_flags & 0x80000000u) != 0;
+            ULONG end_flags = inf->dma_flags & ~0x80000000u;
+            IExec->EndDMA(inf->dma_buf, inf->dma_size, end_flags);
             NVME_LEAK_DEC(nvme_leak_dma);
-            IExec->FreeSysObject(ASOT_DMAENTRY, inf->dma_list);
-            NVME_LEAK_DEC(nvme_leak_dmaentry);
+            if (!dma_list_is_pool) {
+                IExec->FreeSysObject(ASOT_DMAENTRY, inf->dma_list);
+                NVME_LEAK_DEC(nvme_leak_dmaentry);
+            }
             inf->dma_list = NULL;
         }
 

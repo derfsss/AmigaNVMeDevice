@@ -4,15 +4,21 @@ Native AmigaOS 4.1 Final Edition block-device driver for NVMe controllers
 on PCIe.  A single binary runs on every AmigaOS 4.1 FE platform with a
 working PCIe bridge.
 
-**Current release: v1.61 (2026-04-12)** — validated end-to-end on QEMU
-Pegasos2: boots to DOS, partitioned via Media Toolbox, formatted with
-SFS/00, benchmarked with AmigaDiskBench (sustained 265–279 MB/s),
-SMART reported via the `HD_SCSICMD` ATA PASS-THROUGH path.
+**Current release: v1.65 (2026-04-12)** — second-generation performance
+pass on top of v1.61.  `IExec->CopyMem` in the bounce path, pre-allocated
+DMAEntry pool, alignment-aware DMA path selection, and SQ doorbell
+batching.  End-to-end validated on QEMU Pegasos2 (boots to DOS,
+partitioned, SFS/00 formatted, SMART via `HD_SCSICMD` ATA PASS-THROUGH).
+AmigaDiskBench measures +7 % to +12 % across six of seven suites vs the
+v1.61 baseline.
 
 ## Status
 
 All 16 commits of the modernization plan (`docs/modernization_plan.md`)
-are implemented, plus post-modernization bug-fixes through v1.61.
+are implemented, plus v1.56–v1.61 post-modernization bug-fixes, the
+v1.62 structural perf sweep, and the v1.65 perf polish.  See
+`docs/history.md` Session 10 for the design exploration and two
+dead-ends (unsafe pin cache, harmful hybrid-poll) that didn't ship.
 
 ## Platforms
 
@@ -35,6 +41,11 @@ One binary, runtime-detected:
 - **Multi-controller**: up to 4 NVMe devices × 8 namespaces each (32 units total)
 - **Async I/O pipeline**: NVME_MAX_INFLIGHT=16 slots per unit, per-unit I/O task
 - **Shared INTx handling** with per-controller ISR + yield-poll fallback
+- **Alignment-aware DMA path selection (v1.62)**: bounce for small/unaligned transfers, direct DMA for aligned medium+large transfers — skips the memcpy whenever the user buffer is page-aligned
+- **Pre-allocated DMAEntry pool (v1.62)**: one DMAEntry array per inflight slot, sized for worst-case physical fragmentation — eliminates `AllocSysObjectTags`/`FreeSysObject` from the direct-DMA hot path
+- **Batched SQ doorbell writes (v1.62)**: `NVMeIO_SubmitNoRing` + `NVMeIO_RingSQ` let the event loop collapse a burst of N submissions into a single doorbell write
+- **`IExec->CopyMem` on bounce path (v1.65)**: replaces compat.c's byte-by-byte memcpy on bounce fills / copy-backs; biggest single-cell wins on HeavyLifter (+8 %) and on 4 KiB–64 KiB writes that stay on the bounce
+- **MDTS soft-cap 2 MiB (v1.65)**: larger single-command capacity when the controller advertises MDTS=0, bounded by our single-PRP-list-page capacity
 - **64 KiB pre-pinned bounce buffer** per inflight slot, full PRP1/PRP2/PRP-list support
 - **MDTS chunking** for transfers > controller max
 - **TD_READ64/WRITE64** and every NSD 64-bit command

@@ -266,7 +266,24 @@ struct nvme_id_ctrl {
 
 #define NVME_ADMIN_QUEUE_DEPTH    64   /* entries in admin SQ and CQ */
 #define NVME_IO_QUEUE_DEPTH       64   /* entries in each I/O SQ and CQ */
-#define NVME_MAX_INFLIGHT         16   /* max pipelined I/O requests per unit */
+
+/* Maximum pipelined I/O requests per unit.
+ *
+ * Must be strictly less than NVME_IO_QUEUE_DEPTH so the SQ never fills
+ * (we key inflight slots by cid = slot + 1, and cids 1..NVME_MAX_INFLIGHT
+ * reference the NVME_MAX_INFLIGHT SQ tail slots currently unreaped).
+ *
+ * Bounce buffers (one per slot at NVME_BOUNCE_SIZE each), PRP list pages
+ * (one page per slot), and DMAEntry pools (worst_frags entries per slot)
+ * all scale linearly with this constant.  Memory footprint at 16 slots /
+ * 64 KiB bounce / 4 KiB PRP page / 2 MiB MDTS is roughly 1.1 MiB per
+ * open unit.
+ *
+ * A 32-slot experiment in v1.63/v1.64 showed no perf benefit on the
+ * single-client AmigaDiskBench workload (the event loop never has more
+ * than a handful of messages queued at once); kept at 16 as the tested
+ * value with the lowest memory footprint. */
+#define NVME_MAX_INFLIGHT         16
 
 /* Multi-controller limits.
  * A PCIe bus rarely carries more than a handful of NVMe controllers;
@@ -279,14 +296,32 @@ struct nvme_id_ctrl {
 
 /* Pre-pinned bounce buffer size per inflight slot.
  *
- * Chosen to comfortably cover typical filesystem cluster I/O (SFS
- * clusters are 32 KiB; SSFS uses up to 64 KiB writes for stream
- * operations).  Transfers up to and including this size take the
- * fast-path: CopyMem between user buffer and the cached bounce, a
- * single-page-aligned CacheClearE, and no per-request
- * StartDMA/GetDMAList/EndDMA at all.  Larger transfers fall through
- * to the scatter-gather PRP-list path in nvme_io.c. */
+ * Sized to cover typical filesystem cluster I/O (SFS = 32 KiB, SSFS
+ * up to 64 KiB) while bounding the pinned-memory footprint per unit to
+ * NVME_MAX_INFLIGHT × NVME_BOUNCE_SIZE.  The bounce path is only chosen
+ * when a transfer is too small to amortise StartDMA overhead, or when
+ * the user buffer is not page-aligned; everything else takes the
+ * direct-DMA path (no memcpy, pre-allocated DMAEntry pool).  The
+ * selection heuristic lives in nvme_io.c:should_use_bounce. */
 #define NVME_BOUNCE_SIZE        (64u * 1024u)
+
+/* Minimum transfer size at which the direct-DMA path is expected to
+ * beat the bounce path on a page-aligned user buffer.
+ *
+ * The bounce path's cost is dominated by a single memcpy of length
+ * `byte_length` (for writes: user → bounce before Submit; for reads:
+ * bounce → user after Harvest).  The direct path's cost is
+ * StartDMA + GetDMAList + EndDMA on the user buffer, which is roughly
+ * constant per call after the DMAEntry array has been pre-allocated.
+ *
+ * Measured crossover on QEMU Pegasos2: two pages (8 KiB) works well
+ * across read-heavy and random-write workloads (measured +5 %–+23 %
+ * gains at 16 KiB–64 KiB block sizes).  A higher threshold was tried
+ * (16 pages) and lost the read wins without helping the one test
+ * suite that regressed, so 2 is the chosen production value.  Any
+ * value ≥ 1 is safe — the direct path handles arbitrary alignments
+ * via the PRP-list builder. */
+#define NVME_DIRECT_MIN_PAGES   2u
 
 #define NVME_SQE_SIZE  64            /* bytes per SQ entry */
 #define NVME_CQE_SIZE  16            /* bytes per CQ entry */

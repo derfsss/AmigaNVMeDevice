@@ -35,16 +35,25 @@ struct NVMeInflight {
     UWORD            cmd_id;        /* NVMe command ID assigned to this slot */
     BOOL             is_write;      /* TRUE = write (for bounce copy-back) */
 
-    /* Direct DMA path (transfer > NVME_BOUNCE_SIZE) */
+    /* Direct-DMA path state.  `dma_list` points at the slot's
+     * pre-allocated DMAEntry pool (NVMeUnit.dma_entry_pool[slot]) once
+     * GetDMAList has populated it — never to a per-I/O allocation.
+     * EndDMA in Harvest uses `dma_buf`, `dma_size`, and `dma_flags`. */
     APTR             dma_buf;       /* virtual address of user buffer */
     ULONG            dma_phys;      /* physical address from StartDMA */
     ULONG            dma_size;
-    struct DMAEntry *dma_list;
+    struct DMAEntry *dma_list;      /* alias of dma_entry_pool[slot] */
     ULONG            dma_entries;
     ULONG            dma_flags;     /* DMA direction flags for EndDMA */
 
-    /* Bounce buffer path (transfer <= NVME_BOUNCE_SIZE) */
+    /* Bounce-path state — `use_bounce` gates the copy-back in Harvest.
+     * `bounce_user_buf` / `bounce_user_len` snapshot the destination
+     * at Submit time, so that Harvest can copy back correctly even if
+     * the caller has mutated its IORequest (e.g. the MDTS-chunked path
+     * in unit_task.c temporarily overwrites io_Data / io_Length). */
     BOOL             use_bounce;
+    APTR             bounce_user_buf;
+    ULONG            bounce_user_len;
 
     /* For latency tracking — EClock snapshot taken at Submit time,
      * consumed at Harvest.  A 64-bit tick count lives across the two
@@ -115,6 +124,21 @@ struct NVMeUnit {
     /* Pre-allocated PRP list pages (one per inflight slot, 4KB each, MEMF_SHARED) */
     APTR             prp_list_pages[NVME_MAX_INFLIGHT];
     ULONG            prp_list_phys[NVME_MAX_INFLIGHT];
+
+    /* Pre-allocated DMAEntry pool, one array per inflight slot.  The
+     * direct-DMA path in NVMeIO_Submit reuses these instead of issuing
+     * AllocSysObjectTags(ASOT_DMAENTRY) / FreeSysObject per I/O — a
+     * measurable win on large transfers where the AllocSysObject
+     * overhead is a meaningful fraction of end-to-end latency.
+     *
+     * Capacity is sized in UnitTask_Start to cover the worst-case
+     * number of physical fragments a single NVMe command can span,
+     * which is max_transfer_bytes / page_size + 1 (the +1 covers
+     * unaligned starts).  Any I/O whose StartDMA reports more entries
+     * than the pool can hold falls back to a per-I/O AllocSysObject as
+     * a safety net. */
+    struct DMAEntry *dma_entry_pool[NVME_MAX_INFLIGHT];
+    ULONG            dma_entry_pool_capacity; /* entries per slot */
 
     /* Held change-notification requests (must NOT be replied to until removed) */
     struct IOStdReq *changeint_req;

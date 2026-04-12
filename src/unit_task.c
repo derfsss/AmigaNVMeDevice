@@ -264,9 +264,11 @@ static void dispatch_rw(struct NVMeBase *devBase, struct NVMeUnit *unit,
     ULONG total_len = ioreq->io_Length;
     ULONG max_chunk = unit->ctrl->max_transfer_bytes;
 
-    /* Fast path: transfer fits in one NVMe command */
+    /* Fast path: transfer fits in one NVMe command.  Use the no-ring
+     * primitive so the event loop can batch a burst of submissions
+     * behind a single doorbell write. */
     if (total_len <= max_chunk) {
-        LONG rc = NVMeIO_Submit(devBase, unit, ioreq, is_write);
+        LONG rc = NVMeIO_SubmitNoRing(devBase, unit, ioreq, is_write);
         if (rc == 0) return; /* async — Harvest will ReplyMsg */
         if (rc == -1) {
             ioreq->io_Error = IOERR_UNITBUSY;
@@ -635,15 +637,40 @@ static void unit_task_entry(void)
         /* Always harvest completions first — handles ISR wakeup */
         NVMeIO_Harvest(devBase, unit);
 
-        /* Dispatch pending I/O requests */
+        /* Dispatch pending I/O requests.  dispatch_ioreq may submit an
+         * NVMe SQE via the no-ring primitive in nvme_io.c; each path
+         * that ends in NVMeIO_SubmitNoRing bumps the shadow SQ tail but
+         * leaves the doorbell alone.  We snapshot io_sq_tail before the
+         * drain and, after draining, ring the doorbell exactly once if
+         * any SQEs were queued.  This collapses N doorbell writes into
+         * one for a burst of N messages.
+         *
+         * Callers that need an immediate doorbell write (Flush, any
+         * path that uses the convenience NVMeIO_Submit wrapper) are
+         * unaffected — they ring themselves inline and we just observe
+         * the same tail here, turning the second ring into a no-op
+         * write of the same value. */
         if (signals & unit->io_port_mask) {
+            UWORD tail_before = unit->io_sq_tail;
             struct IOStdReq *req;
             while ((req = (struct IOStdReq *)IExec->GetMsg(unit->io_port)) != NULL) {
                 dispatch_ioreq(devBase, unit, req);
             }
+            if (unit->io_sq_tail != tail_before)
+                NVMeIO_RingSQ(unit);
             /* Harvest again after submitting to catch fast completions */
             NVMeIO_Harvest(devBase, unit);
         }
+
+        /* No post-submit spin-poll here on purpose.  An experiment in
+         * v1.63/v1.64 added a bounded Harvest spin after the doorbell
+         * ring to catch immediate completions; on QEMU TCG — which
+         * runs guest CPU and device emulation on the same thread —
+         * the spin starved QEMU's main loop exactly when it needed to
+         * progress the NVMe DMA, producing 11–13 % read regressions.
+         * The outer loop's Forbid/Permit-based yield-poll already
+         * handles fast completions correctly and gives QEMU the CPU
+         * it needs.  See Session 10 in docs/history.md. */
 
         /* Ensure NVMe interrupts are unmasked before looping.
          * Writing INTMC when INTMS is already clear is harmless (NVMe spec). */
@@ -787,6 +814,42 @@ BOOL UnitTask_Start(struct NVMeBase *devBase, struct NVMeUnit *unit)
          * reads stale data on its PRP-list dereference. */
     }
 
+    /* Pre-allocate one DMAEntry array per inflight slot so the direct-
+     * DMA path in NVMeIO_Submit does not need an AllocSysObjectTags
+     * call on every I/O.  Capacity must cover the worst-case number of
+     * physical fragments a single NVMe command can span: that is
+     * max_transfer_bytes / page_size pages of data plus one extra to
+     * cover an unaligned start.  We never expect to exceed this, but
+     * NVMeIO_Submit retains a per-I/O AllocSysObject fallback just in
+     * case.
+     *
+     * Failure to allocate the pool is NON-fatal — we leave
+     * dma_entry_pool[i] = NULL and the Submit path will fall back to
+     * per-I/O AllocSysObject for every direct-DMA request on that
+     * slot.  Correctness is preserved; only the perf win is lost. */
+    {
+        ULONG max_xfer       = unit->ctrl->max_transfer_bytes;
+        ULONG worst_frags    = (max_xfer + page_size - 1) / page_size + 1u;
+        unit->dma_entry_pool_capacity = worst_frags;
+
+        for (int i = 0; i < NVME_MAX_INFLIGHT; i++) {
+            unit->dma_entry_pool[i] = IExec->AllocSysObjectTags(ASOT_DMAENTRY,
+                ASODMAE_NumEntries, worst_frags, TAG_DONE);
+            if (unit->dma_entry_pool[i]) {
+                NVME_LEAK_INC(nvme_leak_dmaentry);
+            } else {
+                /* Log once — subsequent nulls are noise.  Not a fatal
+                 * error, just a performance degradation. */
+                if (i == 0) {
+                    DPRINTF(IExec, "[nvme.device:unit_task] dma_entry_pool alloc"
+                            " failed (worst_frags=%lu) — falling back to per-I/O\n",
+                            worst_frags);
+                }
+            }
+        }
+
+    }
+
     /* Allocate a ready signal bit in the current (parent) task */
     LONG ready_bit = IExec->AllocSignal(-1);
     if (ready_bit < 0) goto fail;
@@ -852,7 +915,13 @@ fail:
             NVME_LEAK_DEC(nvme_leak_vec);
             unit->prp_list_pages[i] = NULL;
         }
+        if (unit->dma_entry_pool[i]) {
+            IExec->FreeSysObject(ASOT_DMAENTRY, unit->dma_entry_pool[i]);
+            NVME_LEAK_DEC(nvme_leak_dmaentry);
+            unit->dma_entry_pool[i] = NULL;
+        }
     }
+    unit->dma_entry_pool_capacity = 0;
     return FALSE;
 }
 
@@ -927,5 +996,11 @@ void UnitTask_Shutdown(struct NVMeBase *devBase, struct NVMeUnit *unit)
             NVME_LEAK_DEC(nvme_leak_vec);
             unit->prp_list_pages[i] = NULL;
         }
+        if (unit->dma_entry_pool[i]) {
+            IExec->FreeSysObject(ASOT_DMAENTRY, unit->dma_entry_pool[i]);
+            NVME_LEAK_DEC(nvme_leak_dmaentry);
+            unit->dma_entry_pool[i] = NULL;
+        }
     }
+    unit->dma_entry_pool_capacity = 0;
 }
