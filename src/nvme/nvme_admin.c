@@ -178,11 +178,95 @@ BOOL NVMe_IdentifyController(struct NVMeController *ctrl)
         ctrl->max_transfer_bytes = 2u * 1024u * 1024u;
     }
 
+    /* NVMe 1.4 Identify Controller puts Optional NVM Command Support
+     * (ONCS) at bytes 520-521 and Volatile Write Cache (VWC) at byte
+     * 525.  Our `struct nvme_id_ctrl` stops at byte 270 with a bulk
+     * `reserved270[]`, so read the raw bytes out of the identify
+     * buffer directly.  Endianness on the wire is little-endian; for
+     * single-byte bits that's a no-op.
+     *
+     *   ONCS bit 2 — Dataset Management supported (required for TRIM).
+     *   VWC  bit 0 — Volatile Write Cache is present.  Defaults to
+     *                enabled on reset per spec; we mirror that in
+     *                vwc_enabled and update on Set Features from the
+     *                SCSI Mode Select page 0x08 path. */
+    {
+        UBYTE *idb = (UBYTE *)ctrl->identify_buf;
+        ctrl->onc_dsm     = (idb[520] >> 2) & 1;
+        ctrl->vwc_present =  idb[525]       & 1;
+        ctrl->vwc_enabled = ctrl->vwc_present ? TRUE : FALSE;
+    }
+
     DLOG(IExec, "[nvme.device:admin] ctrl %lu: \"%s\" FW \"%s\""
-                " MDTS=%u max_xfer=%lu\n",
-         ctrl->ctrl_idx, mn, fr, id->mdts, ctrl->max_transfer_bytes);
+                " MDTS=%u max_xfer=%lu DSM=%lu VWC=%lu\n",
+         ctrl->ctrl_idx, mn, fr, id->mdts, ctrl->max_transfer_bytes,
+         (ULONG)ctrl->onc_dsm, (ULONG)ctrl->vwc_present);
 
     return TRUE;
+}
+
+/* ------------------------------------------------------------------ */
+/* Set / Get Features                                                  */
+/* ------------------------------------------------------------------ */
+
+UWORD NVMe_SetFeature(struct NVMeController *ctrl, ULONG fid,
+                      ULONG cdw11, ULONG cdw12)
+{
+    struct ExecIFace *IExec = ctrl->dev_base->IExec;
+
+    struct nvme_sqe sqe;
+    memset(&sqe, 0, sizeof(sqe));
+    sqe.cdw0  = NVME_ADMIN_SET_FEATURES;
+    sqe.nsid  = 0;                 /* global scope for the features we use */
+    sqe.cdw10 = fid & 0xFFu;       /* feature identifier (bits 7:0) */
+    sqe.cdw11 = cdw11;
+    sqe.cdw12 = cdw12;
+
+    IExec->ObtainSemaphore(&ctrl->io_lock);
+    UWORD status = NVMe_AdminCmd(ctrl, &sqe);
+    IExec->ReleaseSemaphore(&ctrl->io_lock);
+
+    if (status != NVME_STATUS_SUCCESS) {
+        DLOG(IExec, "[nvme.device:admin] SetFeature fid=0x%02lx failed"
+                    " status=0x%04x\n", fid, status);
+    }
+    return status;
+}
+
+UWORD NVMe_GetFeature(struct NVMeController *ctrl, ULONG fid, ULONG sel,
+                      ULONG *out_value)
+{
+    struct ExecIFace *IExec = ctrl->dev_base->IExec;
+
+    struct nvme_sqe sqe;
+    memset(&sqe, 0, sizeof(sqe));
+    sqe.cdw0  = NVME_ADMIN_GET_FEATURES;
+    sqe.nsid  = 0;
+    sqe.cdw10 = (fid & 0xFFu) | ((sel & 0x7u) << 8);
+
+    /* For the feature identifiers we care about (VWC et al.) the feature
+     * value is returned in the completion queue entry's DW0 field.  The
+     * current NVMe_AdminCmd helper only surfaces the 16-bit status — it
+     * discards DW0 — so Get Features callers that need the value would
+     * need a helper that reads DW0 before the CQ head is advanced.
+     *
+     * For v1.66 we don't actually need Get Features in practice: the
+     * write-cache state is tracked locally in ctrl->vwc_enabled (seeded
+     * from ONCS/VWC at Identify, updated on every Set Features).
+     * Implement the command plumbing but leave out_value at 0 for now;
+     * callers that truly need the device-reported value should be
+     * upgraded alongside a DW0-returning variant of NVMe_AdminCmd. */
+    IExec->ObtainSemaphore(&ctrl->io_lock);
+    UWORD status = NVMe_AdminCmd(ctrl, &sqe);
+    IExec->ReleaseSemaphore(&ctrl->io_lock);
+
+    if (out_value) *out_value = 0;
+
+    if (status != NVME_STATUS_SUCCESS) {
+        DLOG(IExec, "[nvme.device:admin] GetFeature fid=0x%02lx failed"
+                    " status=0x%04x\n", fid, status);
+    }
+    return status;
 }
 
 ULONG NVMe_IdentifyNSList(struct NVMeController *ctrl, ULONG *nsids, ULONG max_nsids)

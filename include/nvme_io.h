@@ -94,6 +94,28 @@ LONG NVMeIO_Flush(struct NVMeBase *devBase, struct NVMeUnit *unit,
                   struct IOStdReq *ioreq);
 
 /*
+ * NVMeIO_SubmitAndWait — synchronous variant for internal-to-driver
+ * I/O commands that need to block the unit task until the controller
+ * replies.  Used by the SCSI translation layer (SYNCHRONIZE CACHE,
+ * UNMAP) where the SCSI response depends on the NVMe status.
+ *
+ * Caller supplies a pre-built SQE (opcode + nsid + prp1/prp2 + cdw10-15);
+ * the CID is assigned internally.  The call blocks inside a poll-harvest
+ * loop with a generous timeout, during which the slot is flagged
+ * `suppress_reply` so the ordinary Harvest path does not ReplyMsg the
+ * owning IORequest — the caller owns that and will reply it once it has
+ * translated the NVMe status into SCSI fields.
+ *
+ * Context: unit task only.  Must not be called from the caller path
+ * of a sync-wait command that is already in progress (would nest).
+ *
+ * Returns the NVMe 16-bit status word (0 = success; 0xFFFE = no free
+ * slot; 0xFFFD = timeout; 0xFFxx = device-side NVMe error).
+ */
+UWORD NVMeIO_SubmitAndWait(struct NVMeBase *devBase, struct NVMeUnit *unit,
+                           struct IOStdReq *ioreq, struct nvme_sqe *sqe);
+
+/*
  * NVMeIO_Harvest — drain all pending CQEs on unit's I/O CQ.
  *
  * Context: unit task only, invoked when the unit's IRQ signal fires

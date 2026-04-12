@@ -145,9 +145,22 @@ struct nvme_cqe {
 #define NVME_ADMIN_CREATE_CQ     0x05
 #define NVME_ADMIN_IDENTIFY      0x06
 #define NVME_ADMIN_ABORT         0x08
+#define NVME_ADMIN_SET_FEATURES  0x09
+#define NVME_ADMIN_GET_FEATURES  0x0A
 #define NVME_ADMIN_GET_LOG_PAGE  0x02
 #define NVME_ADMIN_FIRMWARE_COMMIT    0x10
 #define NVME_ADMIN_FIRMWARE_IMAGE_DL  0x11
+
+/* NVMe 1.4 §5.21 — Feature Identifiers (cdw10 of Set/Get Features).
+ * We currently only wire Volatile Write Cache (used by the SCSI Mode
+ * Page 0x08 translation layer); others are here for future completeness. */
+#define NVME_FEATURE_ARBITRATION          0x01
+#define NVME_FEATURE_POWER_MGMT           0x02
+#define NVME_FEATURE_TEMP_THRESHOLD       0x04
+#define NVME_FEATURE_ERROR_RECOVERY       0x05
+#define NVME_FEATURE_VOLATILE_WRITE_CACHE 0x06
+#define NVME_FEATURE_NUM_QUEUES           0x07
+#define NVME_FEATURE_IRQ_COALESCE         0x08
 
 /* Identify CNS values */
 #define NVME_ID_CNS_NAMESPACE    0x00   /* Identify Namespace */
@@ -172,6 +185,33 @@ struct nvme_cqe {
 #define NVME_CMD_FLUSH           0x00
 #define NVME_CMD_WRITE           0x01
 #define NVME_CMD_READ            0x02
+#define NVME_CMD_DSM             0x09   /* Dataset Management — deallocate / TRIM */
+
+/* ------------------------------------------------------------------ */
+/* Dataset Management (DSM) — NVMe 1.4 §6.7                            */
+/* ------------------------------------------------------------------ */
+
+/* CDW11 attribute bits.  We only ever set the deallocate bit (TRIM);
+ * the controller returns Invalid Field in Command if we set AD
+ * without the controller having advertised DSM support via
+ * ONCS.DSM (bit 2 of Identify Controller byte 520).  IDR and IDW
+ * aren't useful for our TRIM pass-through. */
+#define NVME_DSM_ATTR_IDR        (1u << 0)   /* Integral Dataset for Read  */
+#define NVME_DSM_ATTR_IDW        (1u << 1)   /* Integral Dataset for Write */
+#define NVME_DSM_ATTR_AD         (1u << 2)   /* Attribute — Deallocate     */
+
+/* Each DSM command can reference up to 256 16-byte range descriptors
+ * (fills a single 4 KiB page).  NR (cdw10[7:0]) is "number of ranges
+ * minus one", so cdw10 holds 0..255. */
+#define NVME_DSM_MAX_RANGES      256
+
+/* DSM range descriptor — 16 bytes, little-endian on the wire. */
+struct nvme_dsm_range {
+    ULONG  cattr;        /* context attributes (we leave as 0) */
+    ULONG  nlb;          /* length in logical blocks */
+    ULONG  slba_lo;      /* starting LBA, low 32 bits */
+    ULONG  slba_hi;      /* starting LBA, high 32 bits */
+};
 
 /* ------------------------------------------------------------------ */
 /* Identify Namespace data (4096 bytes)                                */

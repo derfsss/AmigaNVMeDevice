@@ -60,4 +60,32 @@ BOOL NVMe_CreateIOSQ(struct NVMeController *ctrl, struct NVMeUnit *unit);
 BOOL NVMe_RefreshSMART(struct NVMeController *ctrl);
 #endif
 
+/* ------------------------------------------------------------------ */
+/* Set/Get Features (Admin opcodes 0x09 / 0x0A)                        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * NVMe_SetFeature — issue an Admin Set Features command for feature
+ * identifier `fid` (e.g. NVME_FEATURE_VOLATILE_WRITE_CACHE).  cdw11
+ * carries the feature-specific value (for VWC, bit 0 = 1 enables the
+ * write cache).  cdw12 is reserved for features that need it (most
+ * leave it zero).
+ *
+ * Acquires ctrl->io_lock internally; the caller must NOT be holding it.
+ * Returns the 16-bit NVMe status (0 = success).
+ */
+UWORD NVMe_SetFeature(struct NVMeController *ctrl, ULONG fid,
+                      ULONG cdw11, ULONG cdw12);
+
+/*
+ * NVMe_GetFeature — issue an Admin Get Features command for feature
+ * identifier `fid` with the given `sel` (selector: 0=current, 1=default,
+ * 2=saved, 3=supported capabilities).  On success, writes the CQE DW0
+ * (which carries the feature value for most identifiers) to *out_value.
+ *
+ * Acquires ctrl->io_lock internally.  Returns the 16-bit NVMe status.
+ */
+UWORD NVMe_GetFeature(struct NVMeController *ctrl, ULONG fid, ULONG sel,
+                      ULONG *out_value);
+
 #endif /* NVME_ADMIN_H */

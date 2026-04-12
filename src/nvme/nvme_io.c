@@ -177,6 +177,7 @@ LONG NVMeIO_SubmitNoRing(struct NVMeBase *devBase, struct NVMeUnit *unit,
     inf->dma_list   = NULL;
     inf->bounce_user_buf = NULL;
     inf->bounce_user_len = 0;
+    inf->suppress_reply  = FALSE;
 
     APTR   data_virt = ioreq->io_Data;
     ULONG  prp1_phys, prp2_phys;
@@ -524,6 +525,7 @@ LONG NVMeIO_Flush(struct NVMeBase *devBase, struct NVMeUnit *unit,
     inf->dma_list        = NULL;
     inf->bounce_user_buf = NULL;
     inf->bounce_user_len = 0;
+    inf->suppress_reply  = FALSE;
 
     struct nvme_sqe sqe_flush;
     memset(&sqe_flush, 0, sizeof(sqe_flush));
@@ -552,6 +554,104 @@ LONG NVMeIO_Flush(struct NVMeBase *devBase, struct NVMeUnit *unit,
      * asking the caller to chase a ring-after. */
     NVMeIO_RingSQ(unit);
     return 0;
+}
+
+/*
+ * NVMeIO_SubmitAndWait — submit a caller-built SQE and block the unit
+ * task until the controller replies.  Unlike NVMeIO_Submit this does
+ * NOT hand the reply back to the normal async harvest path; the inflight
+ * slot is flagged `suppress_reply` so Harvest only does its bookkeeping,
+ * leaving the IOStdReq available to the caller for post-completion work
+ * (typically: translate the NVMe status into SCSI scsi_Status / sense).
+ *
+ * The caller fills opcode / nsid / prp1 / prp2 / cdw10..15 on the SQE;
+ * this function assigns the command ID.  For no-data commands
+ * (Flush, DSM) the caller sets PRPs as required for that command; we
+ * don't touch data buffers here.
+ *
+ * Polling strategy mirrors the chunked-path poll in unit_task.c:
+ * repeatedly Harvest the CQ and yield the CPU to QEMU between passes
+ * via Forbid/Permit.  A 5-second budget protects against a dead
+ * controller.  Interrupt re-unmask is handled on each iteration for
+ * parity with the event-loop yield-poll.
+ */
+UWORD NVMeIO_SubmitAndWait(struct NVMeBase *devBase, struct NVMeUnit *unit,
+                           struct IOStdReq *ioreq, struct nvme_sqe *sqe)
+{
+    struct ExecIFace      *IExec = devBase->IExec;
+
+    LONG slot = find_free_slot(unit);
+    if (slot < 0) {
+        DPRINTF(IExec, "[nvme.device:io] SubmitAndWait: no free slot\n");
+        return 0xFFFEu;
+    }
+
+    UWORD cid = (UWORD)(slot + 1);
+    struct NVMeInflight *inf = &unit->inflight[slot];
+    inf->ioreq           = ioreq;
+    inf->cmd_id          = cid;
+    inf->is_write        = FALSE;
+    inf->use_bounce      = FALSE;
+    inf->dma_list        = NULL;
+    inf->bounce_user_buf = NULL;
+    inf->bounce_user_len = 0;
+    inf->suppress_reply  = TRUE;  /* caller will reply after translating status */
+
+    /* Embed the CID in cdw0[31:16] without disturbing the caller-supplied
+     * opcode and fuse/PSDT bits in the low half. */
+    sqe->cdw0 = (sqe->cdw0 & 0x0000FFFFu) | ((ULONG)cid << 16);
+
+    struct nvme_sqe *sq = (struct nvme_sqe *)unit->io_sq;
+    write_io_sqe(&sq[unit->io_sq_tail], sqe);
+
+    DPRINTF(IExec, "[nvme.device:io] SubmitAndWait: slot=%ld cid=%u opcode=0x%02lx tail=%u\n",
+            slot, cid, (ULONG)(sqe->cdw0 & 0xFFu), unit->io_sq_tail);
+
+    {
+        uint64 tbr = nvme_read_tbr();
+        inf->submit_ticks_hi = (uint32)(tbr >> 32);
+        inf->submit_ticks_lo = (uint32)(tbr & 0xFFFFFFFFu);
+    }
+    unit->stats.inflight_current++;
+    if (unit->stats.inflight_current > unit->stats.inflight_peak)
+        unit->stats.inflight_peak = unit->stats.inflight_current;
+
+    unit->io_sq_tail = (unit->io_sq_tail + 1) % unit->queue_depth;
+    NVMeIO_RingSQ(unit);
+
+    /* Poll-harvest until our slot's ioreq is released (Harvest clears
+     * ioreq unconditionally after processing; suppress_reply just stops
+     * the ReplyMsg).  The NVMe status that Harvest decoded is folded
+     * into ioreq->io_Error; on non-NVMe failure (timeout) we fabricate
+     * an IOERR_ABORTED. */
+    for (ULONG poll = 0; poll < 5000000UL; poll++) {
+        NVMeIO_Harvest(devBase, unit);
+        if (unit->inflight[slot].ioreq == NULL) {
+            /* Slot cleared — completion observed.  The IORequest's
+             * io_Error carries the translated status from the
+             * NVMe_StatusToIOErr mapper; we don't know the raw 16-bit
+             * NVMe status anymore (Harvest discarded it after mapping),
+             * so fold it back into a synthetic 0/non-zero token. */
+            return (ioreq->io_Error == 0) ? 0u : 0xFF00u;
+        }
+        if (unit->ctrl->irq_installed)
+            nvme_w32(unit->ctrl->iobase + NVME_REG_INTMC, 1);
+        /* Yield so QEMU's main loop can run the NVMe emulation BHs and
+         * post the CQE we're waiting for. */
+        IExec->Forbid();
+        IExec->Permit();
+    }
+
+    /* Timeout — forcibly release the slot (otherwise it leaks forever)
+     * and report.  Mask suppression off before clearing so a very-late
+     * CQE doesn't touch a freed IORequest. */
+    DPRINTF(IExec, "[nvme.device:io] SubmitAndWait: timeout (cid=%u slot=%ld)\n",
+            cid, slot);
+    unit->inflight[slot].suppress_reply = FALSE;
+    unit->inflight[slot].ioreq          = NULL;
+    if (unit->stats.inflight_current > 0)
+        unit->stats.inflight_current--;
+    return 0xFFFDu;
 }
 
 /* ISR counters — declared in nvme_irq.c */
@@ -662,8 +762,16 @@ void NVMeIO_Harvest(struct NVMeBase *devBase, struct NVMeUnit *unit)
             inf->dma_list = NULL;
         }
 
+        /* If suppress_reply is set, a synchronous caller inside the
+         * unit task (NVMeIO_SubmitAndWait) is poll-waiting on this
+         * slot and will reply the IORequest once it has translated
+         * the NVMe status into SCSI response fields.  Otherwise
+         * reply here as usual. */
+        BOOL was_suppressed = inf->suppress_reply;
+        inf->suppress_reply = FALSE;
         inf->ioreq = NULL; /* free slot */
-        IExec->ReplyMsg((struct Message *)req);
+        if (!was_suppressed)
+            IExec->ReplyMsg((struct Message *)req);
     }
 
     if (harvested > 0) {

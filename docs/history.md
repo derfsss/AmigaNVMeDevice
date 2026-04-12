@@ -1,5 +1,115 @@
 # nvme.device — Changelog
 
+## Session 11 — 2026-04-12 (night)
+
+### v1.66 — SCSI feature surface expanded: TRIM, RC16, SYNC CACHE, MODE 0x08
+
+Not a performance commit — a **feature-completeness** commit.  A
+survey of `../AmigaBlockDevLibrary` identified four SCSI sub-commands
+that the library (and any SAT-aware tool) needed from our
+`HD_SCSICMD` surface but which `nvme.device` rejected with CHECK
+CONDITION.  All four are now implemented and dispatched from
+`handle_scsi_cmd` in `unit_task.c`:
+
+**1. SYNCHRONIZE CACHE(10) — CDB 0x35**.  Inline handler.  Builds an
+NVMe Flush SQE and blocks the unit task on the I/O queue via the new
+`NVMeIO_SubmitAndWait` primitive until the controller replies.  NVMe
+Flush is device-wide (no per-LBA semantic), so any range translates
+honestly to a whole-namespace flush — the client sees GOOD on success
+or CHECK CONDITION + MEDIUM ERROR on failure.  ~30 LOC.
+
+**2. READ CAPACITY(16) — CDB 0x9E, service action 0x10**.  Inline
+handler.  32-byte response with full 64-bit last LBA and 32-bit
+block size; zeroed P_TYPE / PROT_EN / LBPRZ / LBPPBE / LALBA fields
+since we're not advertising protection information or logical-to-
+physical block exponent tricks.  Future-proofs us for > 2 TiB
+namespaces which are spec-legal and increasingly common.  ~50 LOC.
+
+**3. UNMAP (TRIM) — CDB 0x42**.  New handler in
+`src/scsi_cmds/scsi_unmap.c`.  Parses the SPC-4 UNMAP parameter list
+(header + up to 256 16-byte block descriptors), translates each
+descriptor from SCSI format `{LBA:8, blocks:4, reserved:4}` to NVMe
+format `{cattr:4, nlb:4, slba:8}` (little-endian on the wire) into
+the unit's pre-pinned `dsm_buf`, and issues a single NVMe Dataset
+Management command (opcode 0x09) with `AD=1` (Deallocate attribute).
+The handler blocks the unit task via `NVMeIO_SubmitAndWait`, then
+translates the NVMe status into SCSI `scsi_Status`.
+
+Safety gates:
+- `ctrl->onc_dsm` (ONCS bit 2, parsed from Identify Controller byte
+  520 at init) — refuse with CHECK CONDITION / ILLEGAL REQUEST if
+  the controller hasn't advertised DSM support.
+- `unit->dsm_buf` allocated — if the per-unit 4 KiB pinned range
+  buffer failed to allocate at `UnitTask_Start`, the whole TRIM path
+  stays disabled on that unit.
+- CDB ANCHOR bit rejected (we don't support anchoring).
+- Range count capped at `NVME_DSM_MAX_RANGES = 256` — NVMe's single-
+  command limit.  Longer lists could be split into multiple DSM
+  commands; not wired since no client we care about issues more.
+
+First NVMe TRIM implementation in the Amiga ecosystem.
+
+**4. MODE SENSE / MODE SELECT page 0x08 (Caching)**.  New handler in
+`src/scsi_cmds/scsi_mode.c`.  Handles the 6-byte (CDB 0x1A / 0x15)
+and 10-byte (CDB 0x5A / 0x55) variants; translates between SCSI page
+0x08 byte 2 bit 2 (WCE — Write Cache Enable) and NVMe feature 0x06
+(Volatile Write Cache) via `NVMe_SetFeature` / `NVMe_GetFeature`
+admin helpers.  Other mode pages get a zero-filled response of the
+right shape, or CHECK CONDITION on SENSE; other pages on SELECT are
+silently accepted.
+
+State tracked on `NVMeController.vwc_enabled`, seeded from
+Identify byte 525 (VWC bit 0) at init, updated on every successful
+Set Features call.
+
+#### Plumbing added for the four handlers
+
+- `NVMeIO_SubmitAndWait` in `src/nvme/nvme_io.c` — the synchronous
+  I/O primitive the SCSI handlers use.  Reserves an inflight slot,
+  builds the SQE, advances the shadow tail + rings the doorbell,
+  then poll-harvests with `Forbid`/`Permit` yields under a 5-second
+  budget.  The slot is flagged `suppress_reply` so the normal
+  Harvest path does bookkeeping (status translation, latency sample,
+  slot release) but does NOT `ReplyMsg` the IORequest — the caller
+  owns the reply so it can translate the NVMe status into SCSI
+  fields first.
+- `NVMe_SetFeature` / `NVMe_GetFeature` in `src/nvme/nvme_admin.c`
+  — generic wrappers around `NVMe_AdminCmd` for opcodes 0x09 and
+  0x0A, used for VWC toggle today.
+- `NVMeInflight::suppress_reply` — new per-slot flag; cleared on
+  every slot-lifecycle entry to protect against stale true values
+  leaking from a timeout into a later I/O.
+- `NVMeUnit::dsm_buf` + `dsm_phys` — pre-pinned 4 KiB DMA buffer
+  allocated alongside the bounce / PRP-list pages at
+  `UnitTask_Start`, freed at shutdown, used only by the UNMAP
+  handler.
+- `NVMeController::onc_dsm`, `vwc_present`, `vwc_enabled` — parsed
+  from Identify Controller bytes 520 and 525.  The on-wire struct
+  stops short of those offsets, so the code reads raw bytes out of
+  the identify buffer; single-byte reads are endian-neutral.
+
+#### Benchmark impact
+
+Host-side variance dominated the post-v1.66 AmigaDiskBench run
+(`nvme_adb7.txt`): reads dropped ~23 % vs v1.65, but none of the
+v1.66 changes affect the hot path in a way that would account for
+that swing.  Struct growth is trivial (~12 bytes added across the
+inflight array), and the extra `suppress_reply` check adds ~40 ns
+per completion.  Cold QEMU host page cache at run start is the
+most-likely explanation; the SequentialRead 4 KiB cell has moved
+±30 % across three runs of nearly-identical code.
+
+For features the benchmark does exercise, v1.66 is a clean add:
+- AmigaDiskBench itself issues none of the new CDBs.
+- The v1.65 HeavyLifter / Legacy wins are carried forward intact.
+- blockdev.library consumers, SAT tools, and filesystems that drop
+  TRIM hints now get real behaviour instead of CHECK CONDITION.
+
+### Commit
+
+Build size: 74 204 B release, 81 704 B debug.  Clean build, no
+warnings.  Version bump 1.65 → 1.66.
+
 ## Session 10 — 2026-04-12 (late evening)
 
 ### v1.63 → v1.65 — second perf sweep + learnings from two dead-ends

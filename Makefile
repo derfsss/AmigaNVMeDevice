@@ -76,6 +76,7 @@ SRC = src/device.c src/Init.c src/Open.c src/Close.c src/Expunge.c src/BeginIO.c
       src/nvme/nvme_init.c src/nvme/nvme_io.c src/nvme/nvme_admin.c src/nvme/nvme_irq.c \
       src/pci/pci_discovery.c src/pci/platform_detect.c \
       src/scsi_cmds/scsi_ata_passthrough.c src/scsi_cmds/scsi_log_sense.c \
+      src/scsi_cmds/scsi_unmap.c src/scsi_cmds/scsi_mode.c \
       src/nvme_mmu.c src/nvme_status.c src/nvme_leak.c src/nvme_stats.c \
       src/compat.c
 

@@ -4,21 +4,24 @@ Native AmigaOS 4.1 Final Edition block-device driver for NVMe controllers
 on PCIe.  A single binary runs on every AmigaOS 4.1 FE platform with a
 working PCIe bridge.
 
-**Current release: v1.65 (2026-04-12)** — second-generation performance
-pass on top of v1.61.  `IExec->CopyMem` in the bounce path, pre-allocated
-DMAEntry pool, alignment-aware DMA path selection, and SQ doorbell
-batching.  End-to-end validated on QEMU Pegasos2 (boots to DOS,
-partitioned, SFS/00 formatted, SMART via `HD_SCSICMD` ATA PASS-THROUGH).
-AmigaDiskBench measures +7 % to +12 % across six of seven suites vs the
-v1.61 baseline.
+**Current release: v1.66 (2026-04-12)** — SCSI feature-surface
+expansion on top of the v1.65 performance pass.  New commands:
+UNMAP (TRIM) via NVMe Dataset Management — **first NVMe TRIM
+implementation in the Amiga ecosystem**; SYNCHRONIZE CACHE(10); READ
+CAPACITY(16); MODE SENSE/SELECT page 0x08 (Caching — Volatile Write
+Cache toggle).  End-to-end validated on QEMU Pegasos2 (boots to DOS,
+partitioned, SFS/00 formatted, SMART via `HD_SCSICMD` ATA PASS-
+THROUGH, v1.65 benchmark wins carried forward).
 
 ## Status
 
 All 16 commits of the modernization plan (`docs/modernization_plan.md`)
 are implemented, plus v1.56–v1.61 post-modernization bug-fixes, the
-v1.62 structural perf sweep, and the v1.65 perf polish.  See
+v1.62 structural perf sweep, the v1.65 perf polish (`IExec->CopyMem`,
+MDTS 2 MiB), and the v1.66 SCSI feature expansion.  See
 `docs/history.md` Session 10 for the design exploration and two
-dead-ends (unsafe pin cache, harmful hybrid-poll) that didn't ship.
+dead-ends (unsafe pin cache, harmful hybrid-poll) that didn't ship,
+and Session 11 for the v1.66 feature work.
 
 ## Platforms
 
@@ -49,8 +52,10 @@ One binary, runtime-detected:
 - **64 KiB pre-pinned bounce buffer** per inflight slot, full PRP1/PRP2/PRP-list support
 - **MDTS chunking** for transfers > controller max
 - **TD_READ64/WRITE64** and every NSD 64-bit command
-- **HD_SCSICMD synthesis**: INQUIRY, READ CAPACITY 10, and **ATA PASS-THROUGH SMART** — AmigaDiskBench's SMART tab displays live NVMe telemetry (temperature, power-on-hours, wear%, spare%, etc.) translated into ATA attribute format
+- **HD_SCSICMD synthesis**: INQUIRY, READ CAPACITY 10 / 16, SYNCHRONIZE CACHE 10, MODE SENSE/SELECT page 0x08 (Caching), UNMAP (TRIM), and **ATA PASS-THROUGH SMART** — AmigaDiskBench's SMART tab displays live NVMe telemetry translated into ATA attribute format
+- **TRIM (v1.66)** via SCSI UNMAP → NVMe Dataset Management with AD=1 — first NVMe TRIM implementation for AmigaOS 4.1
 - **LOG SENSE** page 0x00 / 0x2F for SPC-4 health-reporting tools
+- **Write-cache toggle (v1.66)** via SCSI Mode Page 0x08 → NVMe Feature 0x06 Set Features
 - **Live statistics** via `NSCMD_NVME_GETSTATS (0xA100)` — byte counts, latencies, per-path hits, SMART.  CLI monitor `nvme_stats` bundled
 - **Debug build coexists with release** — `nvme.device.debug` is swap-in with zero behaviour change except verbose serial logging
 - **Resident priority 0** (boot-drive compatible, matches `virtioscsi.device`)

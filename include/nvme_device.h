@@ -55,6 +55,13 @@ struct NVMeInflight {
     APTR             bounce_user_buf;
     ULONG            bounce_user_len;
 
+    /* When TRUE, Harvest must NOT ReplyMsg the IORequest — a synchronous
+     * caller inside the unit task (e.g. NVMeIO_SubmitAndWait used by the
+     * SCSI SYNCHRONIZE CACHE / UNMAP handlers) is poll-harvesting the
+     * slot itself and will take care of the reply.  Harvest still does
+     * status translation, stats bookkeeping, and slot release. */
+    BOOL             suppress_reply;
+
     /* For latency tracking — EClock snapshot taken at Submit time,
      * consumed at Harvest.  A 64-bit tick count lives across the two
      * halves of a DoIO. */
@@ -140,6 +147,17 @@ struct NVMeUnit {
     struct DMAEntry *dma_entry_pool[NVME_MAX_INFLIGHT];
     ULONG            dma_entry_pool_capacity; /* entries per slot */
 
+    /* Per-unit DSM (Dataset Management / TRIM) range descriptor buffer.
+     * One 4 KiB page, allocated MEMF_SHARED at UnitTask_Start and left
+     * DMA-pinned for the unit's lifetime (same pattern as the bounce
+     * buffers).  Holds up to NVME_DSM_MAX_RANGES 16-byte descriptors;
+     * the SCSI UNMAP handler fills it on demand, issues one DSM command
+     * per UNMAP request, and the pin stays live across commands.  Only
+     * one DSM can be in flight at a time per unit (the unit task is
+     * single-threaded against this buffer). */
+    APTR             dsm_buf;
+    ULONG            dsm_phys;
+
     /* Held change-notification requests (must NOT be replied to until removed) */
     struct IOStdReq *changeint_req;
     struct IOStdReq *remove_req;       /* held TD_REMOVE request */
@@ -212,6 +230,17 @@ struct NVMeController {
     char                     model[41];     /* MN, NUL-padded  */
     char                     serial[21];    /* SN, NUL-padded  */
     char                     fw_rev[9];     /* FR, NUL-padded  */
+
+    /* Optional NVM Command Support (ONCS) and Volatile Write Cache (VWC)
+     * bits from Identify Controller (bytes 520-521 and 525).  Used by
+     * the SCSI translation layer to reject UNMAP (TRIM) on controllers
+     * that don't support Dataset Management, and to report/toggle the
+     * write-cache state through SCSI Mode Page 0x08.  `vwc_enabled`
+     * tracks the most recent Set Features value we issued; it starts
+     * TRUE because NVMe defaults a present VWC to enabled on reset. */
+    BOOL                     onc_dsm;          /* ONCS bit 2 — DSM supported */
+    BOOL                     vwc_present;      /* VWC byte 525 bit 0 */
+    BOOL                     vwc_enabled;      /* last-known VWC state */
 
 #ifdef ENABLE_SMART
     /* SMART / Health Information Log cache.  Populated lazily on the

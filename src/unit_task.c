@@ -210,6 +210,20 @@ static void handle_scsi_cmd(struct NVMeBase *devBase, struct NVMeUnit *unit,
         NVMe_SCSI_HandleATAPassthrough(devBase, unit, ioreq);
         return;
 
+    case 0x42:  /* UNMAP — SCSI TRIM passed through to NVMe DSM */
+        NVMe_SCSI_HandleUnmap(devBase, unit, ioreq);
+        return;
+
+    case 0x1A:  /* MODE SENSE (6) */
+    case 0x5A:  /* MODE SENSE (10) */
+        NVMe_SCSI_HandleModeSense(devBase, unit, ioreq);
+        return;
+
+    case 0x15:  /* MODE SELECT (6) */
+    case 0x55:  /* MODE SELECT (10) */
+        NVMe_SCSI_HandleModeSelect(devBase, unit, ioreq);
+        return;
+
     case 0x25: { /* READ CAPACITY (10) */
         if (scsiCmd->scsi_Length < 8) {
             scsiCmd->scsi_Status = 2;
@@ -234,6 +248,82 @@ static void handle_scsi_cmd(struct NVMeBase *devBase, struct NVMeUnit *unit,
         scsiCmd->scsi_Actual = 8;
         ioreq->io_Actual = 8;
         ioreq->io_Error = 0;
+        return;
+    }
+
+    case 0x9E: { /* READ CAPACITY (16) — service action 0x10, required
+                  * for > 2 TiB namespaces.  Sub-opcode lives in
+                  * scsi_Command[1] bits [4:0].  We accept service action
+                  * 0x10 (READ CAPACITY) and reject the others. */
+        UBYTE *cdb = (UBYTE *)scsiCmd->scsi_Command;
+        UBYTE service_action = cdb[1] & 0x1Fu;
+        if (service_action != 0x10) {
+            scsiCmd->scsi_Status = 2;
+            fill_auto_sense(scsiCmd, SCSI_SENSE_ILLEGAL_REQUEST, 0x20, 0x00);
+            ioreq->io_Error = HFERR_BadStatus;
+            return;
+        }
+        if (scsiCmd->scsi_Length < 32) {
+            scsiCmd->scsi_Status = 2;
+            ioreq->io_Error = HFERR_BadStatus;
+            return;
+        }
+
+        uint64 last_lba = (unit->total_blocks > 0) ? (unit->total_blocks - 1) : 0;
+        ULONG  lbs      = unit->block_size;
+        UBYTE *buf      = (UBYTE *)scsiCmd->scsi_Data;
+        memset(buf, 0, 32);
+
+        /* Bytes 0-7: last LBA, 64-bit big-endian. */
+        buf[0] = (UBYTE)(last_lba >> 56);
+        buf[1] = (UBYTE)(last_lba >> 48);
+        buf[2] = (UBYTE)(last_lba >> 40);
+        buf[3] = (UBYTE)(last_lba >> 32);
+        buf[4] = (UBYTE)(last_lba >> 24);
+        buf[5] = (UBYTE)(last_lba >> 16);
+        buf[6] = (UBYTE)(last_lba >> 8);
+        buf[7] = (UBYTE)(last_lba);
+        /* Bytes 8-11: block size, 32-bit big-endian. */
+        buf[8]  = (UBYTE)(lbs >> 24);
+        buf[9]  = (UBYTE)(lbs >> 16);
+        buf[10] = (UBYTE)(lbs >> 8);
+        buf[11] = (UBYTE)(lbs);
+        /* Byte 12: P_TYPE (0 = no protection), PROT_EN=0.
+         * Byte 13: LBPRZ=0 in bit 6, LBPPBE=0 in bits [3:0].
+         * Bytes 14-15: LALBA=0 (16 bits, lowest aligned LBA).
+         * Bytes 16-31: reserved.  All zero already from memset. */
+
+        scsiCmd->scsi_Actual = 32;
+        ioreq->io_Actual     = 32;
+        ioreq->io_Error      = 0;
+        return;
+    }
+
+    case 0x35: { /* SYNCHRONIZE CACHE (10) — range-specific flush.  NVMe
+                  * Flush is device-wide (no per-LBA semantic), so we
+                  * honestly translate any range to a whole-namespace
+                  * flush.  Block the unit task until the flush completes
+                  * so we can translate the NVMe status into SCSI status
+                  * before replying the IORequest. */
+        struct nvme_sqe sqe;
+        memset(&sqe, 0, sizeof(sqe));
+        sqe.cdw0 = NVME_CMD_FLUSH;      /* cid embedded by SubmitAndWait */
+        sqe.nsid = unit->nsid;
+
+        UWORD nvme_status = NVMeIO_SubmitAndWait(devBase, unit, ioreq, &sqe);
+        if (nvme_status == 0) {
+            scsiCmd->scsi_Status = 0;   /* GOOD */
+            scsiCmd->scsi_Actual = 0;
+            ioreq->io_Actual     = 0;
+            ioreq->io_Error      = 0;
+        } else {
+            scsiCmd->scsi_Status = 2;   /* CHECK CONDITION */
+            /* MEDIUM ERROR with ASC 0x00 ASCQ 0x00 — generic "nope". */
+            fill_auto_sense(scsiCmd, 0x03 /* MEDIUM ERROR */, 0x00, 0x00);
+            ioreq->io_Actual     = 0;
+            if (ioreq->io_Error == 0)
+                ioreq->io_Error = HFERR_BadStatus;
+        }
         return;
     }
 
@@ -827,6 +917,51 @@ BOOL UnitTask_Start(struct NVMeBase *devBase, struct NVMeUnit *unit)
      * dma_entry_pool[i] = NULL and the Submit path will fall back to
      * per-I/O AllocSysObject for every direct-DMA request on that
      * slot.  Correctness is preserved; only the perf win is lost. */
+    /* Per-unit DSM (Dataset Management) range-descriptor buffer.
+     * One page is plenty — NVME_DSM_MAX_RANGES × 16 bytes = 4 KiB, the
+     * NVMe spec limit.  Pinned DMA for unit lifetime, same pattern as
+     * the bounce buffers.  Allocation failure is non-fatal: the UNMAP
+     * handler refuses with CHECK CONDITION if dsm_buf is NULL. */
+    {
+        unit->dsm_buf = IExec->AllocVecTags(page_size,
+            AVT_Type,      MEMF_SHARED,
+            AVT_Alignment, page_size,
+            AVT_Clear,     0, TAG_DONE);
+        if (unit->dsm_buf) {
+            NVME_LEAK_INC(nvme_leak_vec);
+            ULONG dsm_entries = IExec->StartDMA(unit->dsm_buf, page_size, DMA_ReadFromRAM);
+            if (dsm_entries == 0) {
+                IExec->FreeVec(unit->dsm_buf);
+                NVME_LEAK_DEC(nvme_leak_vec);
+                unit->dsm_buf  = NULL;
+                unit->dsm_phys = 0;
+                DPRINTF(IExec, "[nvme.device:unit_task] DSM buf StartDMA returned 0 — TRIM disabled\n");
+            } else {
+                NVME_LEAK_INC(nvme_leak_dma);
+                struct DMAEntry *dsm_dma = IExec->AllocSysObjectTags(ASOT_DMAENTRY,
+                    ASODMAE_NumEntries, dsm_entries, TAG_DONE);
+                if (!dsm_dma) {
+                    IExec->EndDMA(unit->dsm_buf, page_size, DMA_ReadFromRAM);
+                    NVME_LEAK_DEC(nvme_leak_dma);
+                    IExec->FreeVec(unit->dsm_buf);
+                    NVME_LEAK_DEC(nvme_leak_vec);
+                    unit->dsm_buf  = NULL;
+                    unit->dsm_phys = 0;
+                } else {
+                    NVME_LEAK_INC(nvme_leak_dmaentry);
+                    IExec->GetDMAList(unit->dsm_buf, page_size, DMA_ReadFromRAM, dsm_dma);
+                    unit->dsm_phys = (ULONG)dsm_dma[0].PhysicalAddress;
+                    IExec->FreeSysObject(ASOT_DMAENTRY, dsm_dma);
+                    NVME_LEAK_DEC(nvme_leak_dmaentry);
+                    /* No EndDMA — buffer stays DMA-pinned for unit lifetime. */
+                }
+            }
+        } else {
+            unit->dsm_phys = 0;
+            DPRINTF(IExec, "[nvme.device:unit_task] DSM buf alloc failed — TRIM disabled\n");
+        }
+    }
+
     {
         ULONG max_xfer       = unit->ctrl->max_transfer_bytes;
         ULONG worst_frags    = (max_xfer + page_size - 1) / page_size + 1u;
@@ -922,6 +1057,15 @@ fail:
         }
     }
     unit->dma_entry_pool_capacity = 0;
+    /* Release DSM pin before bailing. */
+    if (unit->dsm_buf) {
+        IExec->EndDMA(unit->dsm_buf, page_size, DMA_ReadFromRAM);
+        NVME_LEAK_DEC(nvme_leak_dma);
+        IExec->FreeVec(unit->dsm_buf);
+        NVME_LEAK_DEC(nvme_leak_vec);
+        unit->dsm_buf  = NULL;
+        unit->dsm_phys = 0;
+    }
     return FALSE;
 }
 
@@ -1003,4 +1147,13 @@ void UnitTask_Shutdown(struct NVMeBase *devBase, struct NVMeUnit *unit)
         }
     }
     unit->dma_entry_pool_capacity = 0;
+    /* Symmetric release of the DSM pin. */
+    if (unit->dsm_buf) {
+        IExec->EndDMA(unit->dsm_buf, page_size, DMA_ReadFromRAM);
+        NVME_LEAK_DEC(nvme_leak_dma);
+        IExec->FreeVec(unit->dsm_buf);
+        NVME_LEAK_DEC(nvme_leak_vec);
+        unit->dsm_buf  = NULL;
+        unit->dsm_phys = 0;
+    }
 }
