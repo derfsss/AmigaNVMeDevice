@@ -91,6 +91,9 @@ static const struct Resident dev_res __attribute__((used)) = {
 /* Prevent execution as a shell command */
 int _start(char *argstring, int arglen, struct ExecBase *sysbase)
 {
-    (void)argstring; (void)arglen; (void)sysbase;
-    return 0;
+    (void)argstring; (void)arglen;
+    struct ExecIFace *IExec = (struct ExecIFace *)sysbase->MainInterface;
+    IExec->DebugPrintF("%s cannot be executed from a shell — install in "
+                       "SYS:Kickstart/ and reboot.\n", DEVNAME);
+    return 20; /* RETURN_FAIL */
 }
