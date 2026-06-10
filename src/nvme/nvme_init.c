@@ -29,12 +29,20 @@
 #define NVME_READY_POLL_ITERS  5000000UL
 
 /* Per-CAP.TO ready budget: TO is in 500 ms units; at ~1 µs per MMIO
- * poll, one TO unit needs ~500k iterations.  Double it for margin. */
+ * poll, one TO unit needs ~500k iterations.  Double it for margin,
+ * but clamp the total: TO can legally be 0xFF (127.5 s), and a bridge
+ * that feeds us garbage CAP bits could otherwise stall the whole boot
+ * for minutes inside this loop.  ~60 s is already far beyond any
+ * consumer drive's worst case. */
+#define NVME_READY_POLL_CAP   60000000UL
+
 static ULONG ready_poll_budget(ULONG cap_lo)
 {
     ULONG to = NVME_CAP_TO(cap_lo);
     ULONG scaled = (to + 1) * 1000000UL;
-    return (scaled > NVME_READY_POLL_ITERS) ? scaled : NVME_READY_POLL_ITERS;
+    if (scaled < NVME_READY_POLL_ITERS) scaled = NVME_READY_POLL_ITERS;
+    if (scaled > NVME_READY_POLL_CAP)   scaled = NVME_READY_POLL_CAP;
+    return scaled;
 }
 
 BOOL InitNVMe(struct NVMeController *ctrl)

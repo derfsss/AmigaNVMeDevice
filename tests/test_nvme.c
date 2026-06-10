@@ -18,7 +18,11 @@
  *   8. 64 KiB bounce-buffer round-trip verify at offset 4 KiB
  *   9. TD_READ64 at a high offset (> 4 GiB into the namespace, if the
  *      namespace is large enough)
- *  10. CloseDevice
+ *  10. 6 MiB round-trip verify — exceeds the 2 MiB MDTS cap, so the
+ *      driver's chunked (>MDTS) submission path runs (3 chunks)
+ *  11. Alignment rejection — block-misaligned length and offset must
+ *      fail cleanly with an error, not truncate silently
+ *  12. CloseDevice
  *
  * Built with -lauto so the clib4 CRT is linked and IExec/IDOS are
  * auto-opened.  All I/O uses IExec->DoIO so failures are synchronous.
@@ -201,13 +205,17 @@ int main(int argc, char *argv[])
         }
     }
 
-    UBYTE *buf = IExec->AllocVecTags(512,
+    /* Single-block buffer sized from the REAL sector size reported by
+     * geometry — a 4K-native namespace would reject 512-byte transfers
+     * as block-misaligned (and rightly so). */
+    ULONG blk = true_sector_size;
+    UBYTE *buf = IExec->AllocVecTags(blk,
         AVT_Type,      MEMF_SHARED,
-        AVT_Alignment, 512,
+        AVT_Alignment, blk,
         AVT_Clear,     0,
         TAG_DONE);
     if (!buf) {
-        report(FALSE, "AllocVecTags 512");
+        report(FALSE, "AllocVecTags %lu", blk);
         goto done;
     }
 
@@ -216,7 +224,7 @@ int main(int argc, char *argv[])
     /* -------------------------------------------------------------- */
     ioreq->io_Command = CMD_READ;
     ioreq->io_Data    = buf;
-    ioreq->io_Length  = 512;
+    ioreq->io_Length  = blk;
     ioreq->io_Offset  = 0;
     if (IExec->DoIO((struct IORequest *)ioreq) == 0) {
         report(TRUE, "CMD_READ block 0  — bytes: %02X %02X %02X %02X",
@@ -226,13 +234,13 @@ int main(int argc, char *argv[])
     }
 
     /* -------------------------------------------------------------- */
-    /* 7. 512-byte single-block write + flush + read-back verify       */
+    /* 7. Single-block write + flush + read-back verify                */
     /* -------------------------------------------------------------- */
-    memset(buf, 0xA5, 512);
+    memset(buf, 0xA5, blk);
     ioreq->io_Command = CMD_WRITE;
     ioreq->io_Data    = buf;
-    ioreq->io_Length  = 512;
-    ioreq->io_Offset  = 512;   /* block 1 — keeps MBR intact */
+    ioreq->io_Length  = blk;
+    ioreq->io_Offset  = blk;   /* block 1 — keeps MBR intact */
     if (IExec->DoIO((struct IORequest *)ioreq) == 0) {
         report(TRUE, "CMD_WRITE block 1 pattern 0xA5");
 
@@ -246,14 +254,14 @@ int main(int argc, char *argv[])
             printf("WARN: CMD_UPDATE io_Error=%d (may not be supported)\n",
                    ioreq->io_Error);
 
-        memset(buf, 0, 512);
+        memset(buf, 0, blk);
         ioreq->io_Command = CMD_READ;
         ioreq->io_Data    = buf;
-        ioreq->io_Length  = 512;
-        ioreq->io_Offset  = 512;
+        ioreq->io_Length  = blk;
+        ioreq->io_Offset  = blk;
         if (IExec->DoIO((struct IORequest *)ioreq) == 0) {
             BOOL ok = TRUE;
-            for (int i = 0; i < 512; i++)
+            for (ULONG i = 0; i < blk; i++)
                 if (buf[i] != 0xA5) { ok = FALSE; break; }
             report(ok, "Block 1 readback verify");
         } else {
@@ -329,7 +337,11 @@ int main(int argc, char *argv[])
     /* -------------------------------------------------------------- */
     /* 9. TD_READ64 at high offset (>4 GiB)                            */
     /* -------------------------------------------------------------- */
-    if (true_total_bytes > (uint64)(5u * 1024u * 1024u) * 1024u) {
+    /* Needs the namespace to extend past 4 GiB so the byte offset's
+     * high 32 bits are non-zero — that's what makes this a true 64-bit
+     * offset test.  (An earlier 5-GiB threshold silently skipped this
+     * on the standard 5 × 10^9-byte test image.) */
+    if (true_total_bytes > 0x100000000ULL + (uint64)true_sector_size) {
         /* Pick an offset near the end of the device, aligned on a
          * sector boundary.  Bytes 512 just before total give us a
          * sector that exists and can be read safely. */
@@ -358,7 +370,111 @@ int main(int argc, char *argv[])
             IExec->FreeVec(hbuf);
         }
     } else {
-        printf("SKIP: TD_READ64 high-offset (namespace < 5 GiB)\n");
+        printf("SKIP: TD_READ64 high-offset (namespace does not extend past 4 GiB)\n");
+    }
+
+    /* -------------------------------------------------------------- */
+    /* 10. 6 MiB round-trip — forces the chunked (>MDTS) path          */
+    /* -------------------------------------------------------------- */
+    {
+        ULONG huge_len = 6u * 1024u * 1024u;   /* 3 chunks at 2 MiB MDTS */
+        ULONG huge_off = 1024u * 1024u;        /* clear of earlier tests */
+        UBYTE *hugebuf = IExec->AllocVecTags(huge_len,
+            AVT_Type,      MEMF_SHARED,
+            AVT_Alignment, 4096,
+            AVT_Clear,     0,
+            TAG_DONE);
+        if (!hugebuf) {
+            report(FALSE, "AllocVecTags 6 MiB");
+        } else {
+            /* Index-keyed pattern with a stride coprime to the chunk
+             * size, so a swapped / repeated / skipped chunk shows up
+             * as a mismatch at the first wrong byte. */
+            for (ULONG i = 0; i < huge_len; i++)
+                hugebuf[i] = (UBYTE)((i * 197u + i / 65536u + 13u) & 0xFF);
+
+            ioreq->io_Command = CMD_WRITE;
+            ioreq->io_Data    = hugebuf;
+            ioreq->io_Length  = huge_len;
+            ioreq->io_Offset  = huge_off;
+            if (IExec->DoIO((struct IORequest *)ioreq) == 0) {
+                BOOL len_ok = (ioreq->io_Actual == huge_len);
+
+                ioreq->io_Command = CMD_UPDATE;
+                ioreq->io_Data    = NULL;
+                ioreq->io_Length  = 0;
+                ioreq->io_Offset  = 0;
+                (void)IExec->DoIO((struct IORequest *)ioreq);
+
+                memset(hugebuf, 0, huge_len);
+                ioreq->io_Command = CMD_READ;
+                ioreq->io_Data    = hugebuf;
+                ioreq->io_Length  = huge_len;
+                ioreq->io_Offset  = huge_off;
+                if (IExec->DoIO((struct IORequest *)ioreq) == 0) {
+                    len_ok = len_ok && (ioreq->io_Actual == huge_len);
+                    BOOL ok = TRUE;
+                    ULONG bad_at = 0;
+                    for (ULONG i = 0; i < huge_len; i++) {
+                        UBYTE expected =
+                            (UBYTE)((i * 197u + i / 65536u + 13u) & 0xFF);
+                        if (hugebuf[i] != expected) {
+                            ok = FALSE;
+                            bad_at = i;
+                            break;
+                        }
+                    }
+                    if (ok && len_ok)
+                        report(TRUE, "6 MiB chunked (>MDTS) round-trip verify");
+                    else if (!ok)
+                        report(FALSE, "6 MiB verify mismatch at offset %lu"
+                                      " (got 0x%02X)",
+                               bad_at, hugebuf[bad_at]);
+                    else
+                        report(FALSE, "6 MiB io_Actual=%lu expected %lu",
+                               ioreq->io_Actual, huge_len);
+                } else {
+                    report(FALSE, "6 MiB CMD_READ io_Error=%d", ioreq->io_Error);
+                }
+            } else {
+                report(FALSE, "6 MiB CMD_WRITE io_Error=%d", ioreq->io_Error);
+            }
+            IExec->FreeVec(hugebuf);
+        }
+    }
+
+    /* -------------------------------------------------------------- */
+    /* 11. Alignment rejection — misaligned length / offset must fail  */
+    /* -------------------------------------------------------------- */
+    {
+        UBYTE *abuf = IExec->AllocVecTags(true_sector_size * 2,
+            AVT_Type,      MEMF_SHARED,
+            AVT_Alignment, true_sector_size,
+            AVT_Clear,     0,
+            TAG_DONE);
+        if (!abuf) {
+            report(FALSE, "AllocVecTags for alignment tests");
+        } else {
+            /* Length that is not a multiple of the block size. */
+            ioreq->io_Command = CMD_READ;
+            ioreq->io_Data    = abuf;
+            ioreq->io_Length  = true_sector_size + 7;
+            ioreq->io_Offset  = 0;
+            LONG rc = IExec->DoIO((struct IORequest *)ioreq);
+            report(rc != 0 && ioreq->io_Error != 0,
+                   "Misaligned length rejected (io_Error=%d)", ioreq->io_Error);
+
+            /* Offset that is not on a block boundary. */
+            ioreq->io_Command = CMD_READ;
+            ioreq->io_Data    = abuf;
+            ioreq->io_Length  = true_sector_size;
+            ioreq->io_Offset  = true_sector_size + 1;
+            rc = IExec->DoIO((struct IORequest *)ioreq);
+            report(rc != 0 && ioreq->io_Error != 0,
+                   "Misaligned offset rejected (io_Error=%d)", ioreq->io_Error);
+
+            IExec->FreeVec(abuf);
+        }
     }
 
 done:

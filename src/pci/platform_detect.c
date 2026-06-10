@@ -159,5 +159,21 @@ BOOL NVMe_MMIOProbe(struct ExecIFace *IExec, ULONG iobase, ULONG *cap_lo_out)
         return FALSE;
     }
 
+    /* Strongest validity gate: the Version register must parse as a
+     * plausible NVMe version (major 1 or 2, minor below 16, low byte
+     * zero per spec layout MJR[31:16].MNR[15:8].TER[7:0] with TER only
+     * used from 1.2.1 on — accept any TER).  A bridge that returns
+     * stale bus data or open-bus noise for CAP_LO can slip past the
+     * four sentinel checks above; it will not also produce a coherent
+     * version number at offset 0x08. */
+    ULONG vs  = nvme_r32(iobase + NVME_REG_VS);
+    ULONG mjr = (vs >> 16) & 0xFFFF;
+    ULONG mnr = (vs >> 8) & 0xFF;
+    if (mjr < 1 || mjr > 2 || mnr > 15) {
+        DLOG(IExec, "[nvme.device:platform] VS=0x%08lx is not a valid"
+                    " NVMe version — register reads are bogus\n", vs);
+        return FALSE;
+    }
+
     return TRUE;
 }

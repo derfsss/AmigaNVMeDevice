@@ -78,6 +78,57 @@ CLAUDE.md is wrong — `exec/exectags.h` defines `AVT_Clear`,
 (TAG_USER+6), so `AVT_Clear, 0` and `AVT_ClearWithValue, 0` are
 identical.
 
+### Session 12 continuation — QEMU validation matrix (same day)
+
+Hardware-free validation sweep across everything QEMU can model.
+Driver changes that came out of it:
+
+- `tests/test_nvme.c`: new step 10 — 6 MiB round-trip that forces the
+  chunked (>MDTS) path (3 × 2 MiB chunks; the v1.67 rewrite of that
+  path had been passing the suite without ever executing).  New step
+  11 — negative tests proving block-misaligned length/offset are
+  rejected with IOERR_BADLENGTH / IOERR_BADADDRESS.  Steps 6/7 now use
+  the geometry-reported sector size instead of hardcoded 512 (a
+  4K-native namespace correctly rejects 512-byte transfers).  The
+  TD_READ64 high-offset gate dropped from 5 GiB to "extends past
+  4 GiB" — the old threshold silently skipped the test on the standard
+  5 × 10^9-byte image, so the 64-bit offset path had never actually run.
+- `nvme_init.c`: ready-poll budget clamped at 60M iterations —
+  CAP.TO=0xFF on a garbage-CAP bridge could otherwise stall boot for
+  minutes.
+- `platform_detect.c`: MMIO probe now also validates the VS register
+  (major 1–2, sane minor) — open-bus noise that slips past the four
+  CAP sentinels will not also produce a coherent NVMe version number.
+
+Validation matrix (AmigaQemuTests):
+
+| Scenario | Machine | Result |
+|---|---|---|
+| Full suite, 5 GB 512b | Pegasos2 | 15/15 incl. TD_READ64 hi:1, 6 MiB chunked, alignment |
+| Multi-controller (2 ctrl) + multi-NS | Pegasos2 | units 0/1/2 all pass |
+| 4K-native namespace (lbs=4096) | Pegasos2 | 14/14 — geometry, I/O, alignment all correct |
+| Driver, no NVMe device | Pegasos2 | clean abort, system boots, OpenDevice fails cleanly |
+| Articia S clean-refuse | AmigaOne | driver declines, full boot, all DOS tests pass |
+| Full suite | SAM460ex | 15/15 — second real platform, AMCC 460EX bridge |
+| Driver, no device | SAM460ex | clean abort, normal boot |
+| **Boot from NVMe** (SYS: on NVMe, only blank SCSI stub else) | Pegasos2 | boots to Workbench, suite passes against own boot drive (block 0 = RDSK) |
+| Debug build, 2× open/close cycles | Pegasos2 | task start/shutdown handshake clean both cycles |
+
+Findings that were NOT driver bugs:
+
+- The initial SAM460ex "hang" reproduced with v1.66 and even with no
+  NVMe device — root cause was the test harness writing Kicklayout
+  with CRLF line endings (Windows text-mode `open()`), which wedges
+  the Sam second-stage loader before AmigaOS starts.  Two
+  AmigaQemuTests fixes landed: LF-only Kicklayout writes, and a
+  filesystem-flush delay before the post-injection reboot (an
+  immediate reboot lost the uploaded files).
+- A full Expunge leak-dump is unreachable on a live system: mounter
+  opens any announced unit and holds it, so lib_OpenCnt never stays 0.
+  Expected AmigaOS behaviour, not a leak.
+- QEMU warns "MSI-X is not supported by interrupt controller" on
+  sam460ex/amigaone — harmless; the driver uses INTx/polling.
+
 ## Session 11 — 2026-04-12 (night)
 
 ### v1.66 — SCSI feature surface expanded: TRIM, RC16, SYNC CACHE, MODE 0x08
