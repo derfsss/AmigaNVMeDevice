@@ -22,7 +22,19 @@
  *      driver's chunked (>MDTS) submission path runs (3 chunks)
  *  11. Alignment rejection — block-misaligned length and offset must
  *      fail cleanly with an error, not truncate silently
- *  12. CloseDevice
+ *  12. SCSI READ CAPACITY(10) + (16) — consistency with the 64-bit
+ *      geometry; on >2 TiB namespaces RC10 must clamp to 0xFFFFFFFF
+ *  13. SCSI SYNCHRONIZE CACHE(10) — NVMe Flush translation
+ *  14. SCSI MODE SENSE/SELECT page 0x08 — write-cache state read and
+ *      toggle (NVMe Set Features 0x06), restored afterwards
+ *  15. SCSI LOG SENSE — pages 0x00 (supported) and 0x2F (informational
+ *      exceptions)
+ *  16. SCSI ATA PASS-THROUGH(16) SMART READ DATA / READ THRESHOLDS —
+ *      ATA attribute table synthesized from the NVMe health log
+ *  17. SCSI UNMAP — NVMe Dataset Management (TRIM) on 8 scratch blocks
+ *  18. (>2 TiB namespaces only) TD_WRITE64/TD_READ64 round-trip at an
+ *      offset beyond 2 TiB
+ *  19. CloseDevice
  *
  * Built with -lauto so the clib4 CRT is linked and IExec/IDOS are
  * auto-opened.  All I/O uses IExec->DoIO so failures are synchronous.
@@ -69,6 +81,37 @@ static void report(BOOL pass, const char *fmt, ...)
     vprintf(fmt, ap);
     va_end(ap);
     printf("\n");
+}
+
+/* ------------------------------------------------------------------ */
+/* HD_SCSICMD helper — issue one CDB, return DoIO result.              */
+/* On return: *status_out = scsi_Status, *actual_out = scsi_Actual.    */
+/* `flags` is SCSIF_READ for data-in, 0 for data-out / no data.        */
+/* ------------------------------------------------------------------ */
+static LONG do_scsi(struct IOStdReq *ioreq, UBYTE *cdb, ULONG cdb_len,
+                    APTR data, ULONG data_len, UBYTE flags,
+                    UBYTE *status_out, ULONG *actual_out)
+{
+    static UBYTE sense[20];
+    struct SCSICmd scsi;
+    memset(&scsi, 0, sizeof(scsi));
+    memset(sense, 0, sizeof(sense));
+    scsi.scsi_Data        = (UWORD *)data;
+    scsi.scsi_Length      = data_len;
+    scsi.scsi_Command     = cdb;
+    scsi.scsi_CmdLength   = (UWORD)cdb_len;
+    scsi.scsi_SenseData   = sense;
+    scsi.scsi_SenseLength = sizeof(sense) - 2;
+    scsi.scsi_Flags       = SCSIF_AUTOSENSE | flags;
+
+    ioreq->io_Command = HD_SCSICMD;
+    ioreq->io_Data    = &scsi;
+    ioreq->io_Length  = sizeof(scsi);
+    LONG rc = IExec->DoIO((struct IORequest *)ioreq);
+
+    if (status_out) *status_out = scsi.scsi_Status;
+    if (actual_out) *actual_out = scsi.scsi_Actual;
+    return rc;
 }
 
 int main(int argc, char *argv[])
@@ -475,6 +518,307 @@ int main(int argc, char *argv[])
 
             IExec->FreeVec(abuf);
         }
+    }
+
+    /* -------------------------------------------------------------- */
+    /* 12. SCSI READ CAPACITY(10) + (16) vs 64-bit geometry            */
+    /* -------------------------------------------------------------- */
+    {
+        UBYTE st;
+        ULONG act;
+
+        UBYTE rc10[8];
+        UBYTE cdb10[10];
+        memset(cdb10, 0, sizeof(cdb10));
+        cdb10[0] = 0x25;
+        memset(rc10, 0, sizeof(rc10));
+        LONG rc = do_scsi(ioreq, cdb10, 10, rc10, sizeof(rc10),
+                          SCSIF_READ, &st, &act);
+        if (rc == 0 && st == 0 && act == 8) {
+            ULONG last10 = ((ULONG)rc10[0] << 24) | ((ULONG)rc10[1] << 16)
+                         | ((ULONG)rc10[2] << 8)  |  (ULONG)rc10[3];
+            ULONG bs10   = ((ULONG)rc10[4] << 24) | ((ULONG)rc10[5] << 16)
+                         | ((ULONG)rc10[6] << 8)  |  (ULONG)rc10[7];
+            uint64 total = dg64.dg_TotalSectors;
+            BOOL ok;
+            if (total > 0xFFFFFFFFULL)
+                ok = (last10 == 0xFFFFFFFFu);   /* >2 TiB must clamp */
+            else
+                ok = (last10 == (ULONG)(total - 1));
+            ok = ok && (bs10 == true_sector_size);
+            report(ok, "SCSI READ CAPACITY(10) last_lba=0x%08lx bs=%lu%s",
+                   last10, bs10,
+                   (total > 0xFFFFFFFFULL) ? " (clamped, >2 TiB)" : "");
+        } else {
+            report(FALSE, "SCSI READ CAPACITY(10) rc=%ld status=%u", rc, st);
+        }
+
+        UBYTE rc16[32];
+        UBYTE cdb16[16];
+        memset(cdb16, 0, sizeof(cdb16));
+        cdb16[0] = 0x9E;
+        cdb16[1] = 0x10;            /* service action: READ CAPACITY */
+        cdb16[13] = 32;             /* allocation length */
+        memset(rc16, 0, sizeof(rc16));
+        rc = do_scsi(ioreq, cdb16, 16, rc16, sizeof(rc16),
+                     SCSIF_READ, &st, &act);
+        if (rc == 0 && st == 0 && act == 32) {
+            uint64 last16 = 0;
+            for (int i = 0; i < 8; i++)
+                last16 = (last16 << 8) | rc16[i];
+            ULONG bs16 = ((ULONG)rc16[8] << 24) | ((ULONG)rc16[9] << 16)
+                       | ((ULONG)rc16[10] << 8) |  (ULONG)rc16[11];
+            BOOL ok = (last16 == dg64.dg_TotalSectors - 1)
+                   && (bs16 == true_sector_size);
+            report(ok, "SCSI READ CAPACITY(16) last_lba=(hi:%lu lo:%lu) bs=%lu",
+                   (ULONG)(last16 >> 32), (ULONG)(last16 & 0xFFFFFFFFu), bs16);
+        } else {
+            report(FALSE, "SCSI READ CAPACITY(16) rc=%ld status=%u", rc, st);
+        }
+    }
+
+    /* -------------------------------------------------------------- */
+    /* 13. SCSI SYNCHRONIZE CACHE(10) — NVMe Flush translation         */
+    /* -------------------------------------------------------------- */
+    {
+        UBYTE st;
+        UBYTE cdb[10];
+        memset(cdb, 0, sizeof(cdb));
+        cdb[0] = 0x35;
+        LONG rc = do_scsi(ioreq, cdb, 10, NULL, 0, 0, &st, NULL);
+        report(rc == 0 && st == 0,
+               "SCSI SYNCHRONIZE CACHE(10) rc=%ld status=%u", rc, st);
+    }
+
+    /* -------------------------------------------------------------- */
+    /* 14. SCSI MODE SENSE/SELECT page 0x08 — write-cache toggle       */
+    /* -------------------------------------------------------------- */
+    {
+        UBYTE st;
+        ULONG act;
+        UBYTE sense_cdb[6] = { 0x1A, 0, 0x08, 0, 32, 0 };
+        UBYTE page[32];
+
+        memset(page, 0, sizeof(page));
+        LONG rc = do_scsi(ioreq, sense_cdb, 6, page, sizeof(page),
+                          SCSIF_READ, &st, &act);
+        if (rc == 0 && st == 0 && act >= 4 + 3 &&
+            (page[4] & 0x3F) == 0x08) {
+            BOOL wce_initial = (page[6] & 0x04) != 0;
+            report(TRUE, "SCSI MODE SENSE(6) page 0x08 — WCE=%d", wce_initial);
+
+            /* Toggle WCE via MODE SELECT(6): 4-byte header + 20-byte
+             * caching page. */
+            UBYTE param[24];
+            memset(param, 0, sizeof(param));
+            param[4] = 0x08;        /* page code */
+            param[5] = 0x12;        /* page length */
+            param[6] = wce_initial ? 0x00 : 0x04;
+            UBYTE select_cdb[6] = { 0x15, 0x10, 0, 0, sizeof(param), 0 };
+            rc = do_scsi(ioreq, select_cdb, 6, param, sizeof(param),
+                         0, &st, NULL);
+            BOOL select_ok = (rc == 0 && st == 0);
+
+            /* Read back — if the controller has a volatile write cache
+             * the state must have flipped; if not, the driver accepts
+             * the select as a no-op and the state stays put. */
+            memset(page, 0, sizeof(page));
+            rc = do_scsi(ioreq, sense_cdb, 6, page, sizeof(page),
+                         SCSIF_READ, &st, &act);
+            BOOL wce_after = (page[6] & 0x04) != 0;
+            report(select_ok && rc == 0 && st == 0,
+                   "SCSI MODE SELECT(6) WCE %d -> %d%s",
+                   wce_initial, wce_after,
+                   (wce_after == wce_initial) ? " (no VWC — accepted as no-op)"
+                                              : " (toggled)");
+
+            /* Restore the initial state. */
+            param[6] = wce_initial ? 0x04 : 0x00;
+            (void)do_scsi(ioreq, select_cdb, 6, param, sizeof(param),
+                          0, &st, NULL);
+        } else {
+            report(FALSE, "SCSI MODE SENSE(6) page 0x08 rc=%ld status=%u"
+                          " actual=%lu", rc, st, act);
+        }
+    }
+
+    /* -------------------------------------------------------------- */
+    /* 15. SCSI LOG SENSE — pages 0x00 and 0x2F                        */
+    /* -------------------------------------------------------------- */
+    {
+        UBYTE st;
+        ULONG act;
+        UBYTE buf0[16];
+        UBYTE cdb[10];
+        memset(cdb, 0, sizeof(cdb));
+        cdb[0] = 0x4D;
+        cdb[2] = 0x00;              /* page 0x00 — supported pages */
+        cdb[8] = sizeof(buf0);
+        memset(buf0, 0, sizeof(buf0));
+        LONG rc = do_scsi(ioreq, cdb, 10, buf0, sizeof(buf0),
+                          SCSIF_READ, &st, &act);
+        BOOL lists_2f = FALSE;
+        for (ULONG i = 4; i < act && i < sizeof(buf0); i++)
+            if (buf0[i] == 0x2F) lists_2f = TRUE;
+        report(rc == 0 && st == 0 && lists_2f,
+               "SCSI LOG SENSE page 0x00 (lists 0x2F: %s)",
+               lists_2f ? "yes" : "no");
+
+        UBYTE buf2f[16];
+        cdb[2] = 0x2F;
+        cdb[8] = sizeof(buf2f);
+        memset(buf2f, 0, sizeof(buf2f));
+        rc = do_scsi(ioreq, cdb, 10, buf2f, sizeof(buf2f),
+                     SCSIF_READ, &st, &act);
+        report(rc == 0 && st == 0 && act >= 12 && (buf2f[0] & 0x3F) == 0x2F,
+               "SCSI LOG SENSE page 0x2F (IE ASC=0x%02x temp=%u C)",
+               buf2f[8], buf2f[10]);
+    }
+
+    /* -------------------------------------------------------------- */
+    /* 16. SCSI ATA PASS-THROUGH(16) — SMART READ DATA / THRESHOLDS    */
+    /* -------------------------------------------------------------- */
+    {
+        UBYTE st;
+        ULONG act;
+        UBYTE *smart = IExec->AllocVecTags(512, AVT_Type, MEMF_SHARED,
+                                           AVT_Clear, 0, TAG_DONE);
+        if (!smart) {
+            report(FALSE, "AllocVecTags for SMART buffer");
+        } else {
+            UBYTE cdb[16];
+            memset(cdb, 0, sizeof(cdb));
+            cdb[0]  = 0x85;         /* ATA PASS-THROUGH (16) */
+            cdb[4]  = 0xD0;         /* features: SMART READ DATA */
+            cdb[14] = 0xB0;         /* ATA command: SMART */
+            LONG rc = do_scsi(ioreq, cdb, 16, smart, 512,
+                              SCSIF_READ, &st, &act);
+            /* Attribute entries: 12 bytes each from offset 2; a valid
+             * table has at least one non-zero attribute ID. */
+            ULONG attrs = 0;
+            UBYTE first_id = 0;
+            for (ULONG off = 2; off + 12 <= 362; off += 12) {
+                if (smart[off] != 0) {
+                    if (!attrs) first_id = smart[off];
+                    attrs++;
+                }
+            }
+            report(rc == 0 && st == 0 && act == 512 && attrs > 0,
+                   "SCSI ATA PASS-THROUGH SMART READ DATA — %lu attrs"
+                   " (first id %u)", attrs, first_id);
+
+            cdb[4] = 0xD1;          /* SMART READ THRESHOLDS */
+            memset(smart, 0, 512);
+            rc = do_scsi(ioreq, cdb, 16, smart, 512,
+                         SCSIF_READ, &st, &act);
+            report(rc == 0 && st == 0 && act == 512 && smart[2] != 0,
+                   "SCSI ATA PASS-THROUGH SMART READ THRESHOLDS");
+            IExec->FreeVec(smart);
+        }
+    }
+
+    /* -------------------------------------------------------------- */
+    /* 17. SCSI UNMAP — NVMe Dataset Management (TRIM)                 */
+    /* -------------------------------------------------------------- */
+    {
+        UBYTE st;
+        /* Write a pattern to 8 scratch blocks at 8 MiB, TRIM them, and
+         * confirm both the UNMAP and a subsequent read succeed.  The
+         * post-TRIM content is deliberately not asserted — the spec
+         * leaves deallocated-read values to the device. */
+        ULONG  scratch_len = 8 * true_sector_size;
+        uint64 scratch_off = 8u * 1024u * 1024u;
+        UBYTE *sbuf = IExec->AllocVecTags(scratch_len,
+            AVT_Type, MEMF_SHARED, AVT_Alignment, 4096,
+            AVT_Clear, 0, TAG_DONE);
+        if (!sbuf) {
+            report(FALSE, "AllocVecTags for UNMAP scratch");
+        } else {
+            memset(sbuf, 0x5A, scratch_len);
+            ioreq->io_Command = CMD_WRITE;
+            ioreq->io_Data    = sbuf;
+            ioreq->io_Length  = scratch_len;
+            ioreq->io_Offset  = (ULONG)scratch_off;
+            LONG rc = IExec->DoIO((struct IORequest *)ioreq);
+            if (rc != 0) {
+                report(FALSE, "UNMAP scratch CMD_WRITE io_Error=%d",
+                       ioreq->io_Error);
+            } else {
+                uint64 lba = scratch_off / true_sector_size;
+                UBYTE param[8 + 16];
+                memset(param, 0, sizeof(param));
+                param[1] = sizeof(param) - 2;   /* UNMAP data length */
+                param[3] = 16;                  /* block descriptor bytes */
+                for (int i = 0; i < 8; i++)
+                    param[8 + i] = (UBYTE)(lba >> (56 - i * 8));
+                param[19] = 8;                  /* block count */
+                UBYTE cdb[10];
+                memset(cdb, 0, sizeof(cdb));
+                cdb[0] = 0x42;
+                cdb[8] = sizeof(param);         /* parameter list length */
+                rc = do_scsi(ioreq, cdb, 10, param, sizeof(param),
+                             0, &st, NULL);
+                report(rc == 0 && st == 0,
+                       "SCSI UNMAP (TRIM) 8 blocks @ LBA %lu rc=%ld status=%u",
+                       (ULONG)lba, rc, st);
+
+                memset(sbuf, 0xEE, scratch_len);
+                ioreq->io_Command = CMD_READ;
+                ioreq->io_Data    = sbuf;
+                ioreq->io_Length  = scratch_len;
+                ioreq->io_Offset  = (ULONG)scratch_off;
+                rc = IExec->DoIO((struct IORequest *)ioreq);
+                report(rc == 0, "Post-TRIM read of deallocated range"
+                       " (first byte 0x%02X)", sbuf[0]);
+            }
+            IExec->FreeVec(sbuf);
+        }
+    }
+
+    /* -------------------------------------------------------------- */
+    /* 18. (>2 TiB only) TD_WRITE64/READ64 round-trip past 2 TiB       */
+    /* -------------------------------------------------------------- */
+    if (true_total_bytes > 0x20000000000ULL + (uint64)true_sector_size) {
+        uint64 far_off = 0x20000000000ULL;       /* 2 TiB, block-aligned */
+        UBYTE *fbuf = IExec->AllocVecTags(true_sector_size,
+            AVT_Type, MEMF_SHARED, AVT_Alignment, true_sector_size,
+            AVT_Clear, 0, TAG_DONE);
+        if (!fbuf) {
+            report(FALSE, "AllocVecTags for >2 TiB test");
+        } else {
+            for (ULONG i = 0; i < true_sector_size; i++)
+                fbuf[i] = (UBYTE)((i * 89u + 3u) & 0xFF);
+            ioreq->io_Command = TD_WRITE64;
+            ioreq->io_Data    = fbuf;
+            ioreq->io_Length  = true_sector_size;
+            ioreq->io_Offset  = (ULONG)(far_off & 0xFFFFFFFFu);
+            ioreq->io_Actual  = (ULONG)(far_off >> 32);
+            if (IExec->DoIO((struct IORequest *)ioreq) == 0) {
+                memset(fbuf, 0, true_sector_size);
+                ioreq->io_Command = TD_READ64;
+                ioreq->io_Data    = fbuf;
+                ioreq->io_Length  = true_sector_size;
+                ioreq->io_Offset  = (ULONG)(far_off & 0xFFFFFFFFu);
+                ioreq->io_Actual  = (ULONG)(far_off >> 32);
+                if (IExec->DoIO((struct IORequest *)ioreq) == 0) {
+                    BOOL ok = TRUE;
+                    for (ULONG i = 0; i < true_sector_size; i++)
+                        if (fbuf[i] != (UBYTE)((i * 89u + 3u) & 0xFF)) {
+                            ok = FALSE; break;
+                        }
+                    report(ok, "TD_WRITE64/READ64 round-trip at 2 TiB");
+                } else {
+                    report(FALSE, ">2 TiB TD_READ64 io_Error=%d",
+                           ioreq->io_Error);
+                }
+            } else {
+                report(FALSE, ">2 TiB TD_WRITE64 io_Error=%d",
+                       ioreq->io_Error);
+            }
+            IExec->FreeVec(fbuf);
+        }
+    } else {
+        printf("SKIP: >2 TiB round-trip (namespace too small)\n");
     }
 
 done:

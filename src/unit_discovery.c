@@ -74,6 +74,18 @@ ULONG DiscoverUnits(struct NVMeController *ctrl)
             continue;
         }
 
+        /* A namespace with NSZE=0 has no addressable blocks — exposing
+         * it as a unit would only produce LBA-out-of-range errors on
+         * every access.  Skip it (seen with zero-length backing files
+         * under QEMU; also matches inactive namespaces on real drives). */
+        if (unit->total_blocks == 0) {
+            DLOG(IExec, "[nvme.device:discovery] ctrl %lu NS %lu has zero"
+                        " capacity — skipping\n", ctrl->ctrl_idx, nsids[i]);
+            IExec->FreeVec(unit);
+            NVME_LEAK_DEC(nvme_leak_vec);
+            continue;
+        }
+
         ULONG sq_bytes = NVME_IO_QUEUE_DEPTH * NVME_SQE_SIZE;
         ULONG cq_bytes = NVME_IO_QUEUE_DEPTH * NVME_CQE_SIZE;
 

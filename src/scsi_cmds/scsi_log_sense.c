@@ -17,6 +17,7 @@
 
 #include "nvme_device.h"
 #include "nvme_scsi.h"
+#include "nvme_admin.h"
 #include "nvme_debug.h"
 
 #include <devices/scsidisk.h>
@@ -83,6 +84,20 @@ static ULONG emit_ie_page(UBYTE *buf, ULONG alloc,
     UBYTE temp_c  = 0;
 
 #ifdef ENABLE_SMART
+    /* Refresh the health log if it has never been read or has gone
+     * stale — without this, a tool whose FIRST query is LOG SENSE
+     * (rather than ATA PASS-THROUGH or GETSTATS) would get zeros. */
+    {
+        struct NVMeSMARTCache *sc = &ctrl->smart_cache;
+        uint32 freq   = nvme_eclock_freq();
+        uint64 now    = nvme_read_tbr();
+        uint64 age    = (sc->last_refresh_tbr && now >= sc->last_refresh_tbr)
+                      ? (now - sc->last_refresh_tbr) : ~(uint64)0;
+        uint64 window = (uint64)freq * NVME_SMART_REFRESH_SECS;
+        if (!sc->valid || age > window)
+            (void)NVMe_RefreshSMART(ctrl);
+    }
+
     if (ctrl->smart_cache.valid) {
         struct NVMeSMARTCache *v = &ctrl->smart_cache;
         int t = (int)v->temp_k - 273;
