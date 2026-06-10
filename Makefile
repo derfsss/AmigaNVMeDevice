@@ -59,6 +59,8 @@ REL_TEST   = $(BUILD_DIR)/test_nvme
 DBG_TEST   = $(BUILD_DIR)/test_nvme.debug
 REL_STATS  = $(BUILD_DIR)/nvme_stats
 DBG_STATS  = $(BUILD_DIR)/nvme_stats.debug
+REL_STRESS = $(BUILD_DIR)/stress_nvme
+REL_PERSIST = $(BUILD_DIR)/persist_nvme
 
 DEPLOY_DIR ?= ./deploy
 
@@ -94,7 +96,7 @@ DBG_OBJ = $(patsubst src/%.c, $(DBG_DIR)/%.o, $(SRC))
 # Default target builds both flavours so you always get a matched pair.
 all: release debug
 
-release: $(REL_TARGET) $(REL_TEST) $(REL_STATS)
+release: $(REL_TARGET) $(REL_TEST) $(REL_STATS) $(REL_STRESS) $(REL_PERSIST)
 
 debug: $(DBG_TARGET) $(DBG_TEST) $(DBG_STATS)
 
@@ -107,6 +109,14 @@ $(REL_TEST): tests/test_nvme.c $(REL_TARGET)
 	$(CC) $(COMMON_CFLAGS) $< -o $@ -lauto
 
 $(REL_STATS): tests/nvme_stats.c $(REL_TARGET)
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(COMMON_CFLAGS) $< -o $@ -lauto
+
+$(REL_STRESS): tests/stress_nvme.c $(REL_TARGET)
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(COMMON_CFLAGS) $< -o $@ -lauto
+
+$(REL_PERSIST): tests/persist_nvme.c $(REL_TARGET)
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(COMMON_CFLAGS) $< -o $@ -lauto
 

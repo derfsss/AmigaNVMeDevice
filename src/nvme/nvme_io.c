@@ -598,8 +598,24 @@ UWORD NVMeIO_SubmitAndWait(struct NVMeBase *devBase, struct NVMeUnit *unit,
 
     LONG slot = find_free_slot(unit);
     if (slot < 0) {
-        DPRINTF(IExec, "[nvme.device:io] SubmitAndWait: no free slot\n");
-        return 0xFFFEu;
+        /* Pipeline full — apply back-pressure like the R/W path: ring
+         * the doorbell so any batched SQEs can complete, then
+         * poll-harvest until a slot frees.  We're on the unit task so
+         * nothing else will drain the CQ for us. */
+        NVMeIO_RingSQ(unit);
+        for (ULONG poll = 0; poll < 5000000UL && slot < 0; poll++) {
+            NVMeIO_Harvest(devBase, unit);
+            slot = find_free_slot(unit);
+            if (slot >= 0) break;
+            if (unit->ctrl->irq_installed)
+                nvme_w32(unit->ctrl->iobase + NVME_REG_INTMC, 1);
+            IExec->Forbid();
+            IExec->Permit();
+        }
+        if (slot < 0) {
+            DPRINTF(IExec, "[nvme.device:io] SubmitAndWait: no free slot\n");
+            return 0xFFFEu;
+        }
     }
 
     UWORD cid = (UWORD)(slot + 1);

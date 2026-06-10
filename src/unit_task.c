@@ -381,6 +381,42 @@ static void handle_scsi_cmd(struct NVMeBase *devBase, struct NVMeUnit *unit,
 }
 
 /* ------------------------------------------------------------------ */
+/* Inflight back-pressure                                              */
+/*                                                                      */
+/* The pipeline has NVME_MAX_INFLIGHT slots.  When a burst of async    */
+/* requests exceeds that, the correct behaviour is to WAIT for a slot  */
+/* (the caller used SendIO precisely because it wants queueing), not   */
+/* to fail with IOERR_UNITBUSY — a filesystem driving more than 16     */
+/* concurrent requests would otherwise see spurious I/O errors.        */
+/*                                                                      */
+/* We are on the unit task, so completions don't need us to be in      */
+/* Wait(): poll-harvest until a slot frees.  The shadow SQ tail may    */
+/* hold batched-but-unpublished SQEs (the event loop defers the        */
+/* doorbell), so ring FIRST — otherwise the very commands that will    */
+/* free the slots are invisible to the controller and this would spin  */
+/* until the timeout.  Bounded poll so a dead controller still fails.  */
+/* ------------------------------------------------------------------ */
+
+static BOOL wait_for_free_slot(struct NVMeBase *devBase, struct NVMeUnit *unit,
+                               struct ExecIFace *IExec)
+{
+    NVMeIO_RingSQ(unit);   /* publish anything batched so it can complete */
+
+    for (LONG poll = 0; poll < 5000000; poll++) {
+        for (int i = 0; i < NVME_MAX_INFLIGHT; i++)
+            if (unit->inflight[i].ioreq == NULL)
+                return TRUE;
+        NVMeIO_Harvest(devBase, unit);
+        if (unit->ctrl->irq_installed)
+            nvme_w32(unit->ctrl->iobase + NVME_REG_INTMC, 1);
+        /* Yield so the device model (QEMU TCG) / other tasks can run. */
+        IExec->Forbid();
+        IExec->Permit();
+    }
+    return FALSE;
+}
+
+/* ------------------------------------------------------------------ */
 /* Read/Write dispatch with MDTS chunking                              */
 /*                                                                      */
 /* If the transfer exceeds the controller's max_transfer_bytes (MDTS), */
@@ -398,14 +434,18 @@ static void dispatch_rw(struct NVMeBase *devBase, struct NVMeUnit *unit,
 
     /* Fast path: transfer fits in one NVMe command.  Use the no-ring
      * primitive so the event loop can batch a burst of submissions
-     * behind a single doorbell write. */
+     * behind a single doorbell write.  A full pipeline applies
+     * back-pressure (wait for a slot) rather than failing. */
     if (total_len <= max_chunk) {
         LONG rc = NVMeIO_SubmitNoRing(devBase, unit, ioreq, is_write);
-        if (rc == 0) return; /* async — Harvest will ReplyMsg */
         if (rc == -1) {
-            ioreq->io_Error = IOERR_UNITBUSY;
             unit->stats.unitbusy_hits++;
+            if (wait_for_free_slot(devBase, unit, IExec))
+                rc = NVMeIO_SubmitNoRing(devBase, unit, ioreq, is_write);
         }
+        if (rc == 0) return; /* async — Harvest will ReplyMsg */
+        if (rc == -1)
+            ioreq->io_Error = IOERR_UNITBUSY;   /* pipeline dead for ~5 s */
         IExec->ReplyMsg((struct Message *)ioreq);
         return;
     }
@@ -443,12 +483,16 @@ static void dispatch_rw(struct NVMeBase *devBase, struct NVMeUnit *unit,
         ioreq->io_Length = chunk;
 
         LONG rc = NVMeIO_Submit(devBase, unit, ioreq, is_write);
+        if (rc == -1) {
+            /* Pipeline full of other requests — wait for a slot. */
+            unit->stats.unitbusy_hits++;
+            if (wait_for_free_slot(devBase, unit, IExec))
+                rc = NVMeIO_Submit(devBase, unit, ioreq, is_write);
+        }
         if (rc != 0) {
             /* Submit failed — no inflight to harvest */
-            if (rc == -1) {
+            if (rc == -1)
                 ioreq->io_Error = IOERR_UNITBUSY;
-                unit->stats.unitbusy_hits++;
-            }
             break;
         }
 
@@ -575,11 +619,14 @@ static void dispatch_ioreq(struct NVMeBase *devBase, struct NVMeUnit *unit,
     case CMD_FLUSH:
     case ETD_UPDATE: {
         LONG rc = NVMeIO_Flush(devBase, unit, ioreq);
-        if (rc == 0) return;
         if (rc == -1) {
-            ioreq->io_Error = IOERR_UNITBUSY;
             unit->stats.unitbusy_hits++;
+            if (wait_for_free_slot(devBase, unit, IExec))
+                rc = NVMeIO_Flush(devBase, unit, ioreq);
         }
+        if (rc == 0) return;
+        if (rc == -1)
+            ioreq->io_Error = IOERR_UNITBUSY;
         IExec->ReplyMsg((struct Message *)ioreq);
         return;
     }

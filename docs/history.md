@@ -114,6 +114,50 @@ Validation matrix (AmigaQemuTests):
 | **Boot from NVMe** (SYS: on NVMe, only blank SCSI stub else) | Pegasos2 | boots to Workbench, suite passes against own boot drive (block 0 = RDSK) |
 | Debug build, 2× open/close cycles | Pegasos2 | task start/shutdown handshake clean both cycles |
 
+### Session 12, part 3 — SCSI coverage, >2 TiB, concurrency back-pressure
+
+Closing the remaining hardware-free gaps.
+
+**Test coverage** (`test_nvme` 18 steps / up to 27 checks, plus two new
+tools):
+
+- Full SCSI-translation coverage: READ CAPACITY(10/16) vs the 64-bit
+  geometry, SYNCHRONIZE CACHE(10), MODE SENSE/SELECT page 0x08 with a
+  real WCE toggle through Set Features (verified flipped, then
+  restored), LOG SENSE 0x00/0x2F, ATA PASS-THROUGH SMART READ
+  DATA/THRESHOLDS (asserts a populated attribute table), and UNMAP
+  (write → TRIM → re-read).
+- 4 TiB qcow2 namespace: RC10 clamps to 0xFFFFFFFF, RC16 reports the
+  true 64-bit count, round-trips at 2 TiB and at the last sector.
+  27/27.
+- `tests/stress_nvme.c`: 24 concurrent SendIO requests (pipeline is 16
+  slots), write/read/mixed rounds with per-request patterns, an
+  AbortIO storm, and a post-abort integrity check.
+- `tests/persist_nvme.c`: write+flush phase, hard power-cycle, fresh
+  boot, verify phase.  The pattern was additionally confirmed at the
+  exact expected byte offset in the raw host image.
+
+**Driver fixes the new coverage forced:**
+
+- **Inflight back-pressure** (`unit_task.c`, `nvme_io.c`): a burst of
+  more than 16 concurrent requests used to fail the overflow with
+  IOERR_UNITBUSY — stress showed 8 of 24 requests erroring every
+  round.  Full-pipeline submissions now ring the doorbell (batched
+  SQEs must be published or nothing can complete) and poll-harvest
+  until a slot frees; UNITBUSY remains only as the ~5 s
+  dead-controller fallback.  `NVMeIO_SubmitAndWait` (SYNC CACHE /
+  UNMAP / DSM) gained the same wait.  Stress: 14/14, zero UNITBUSY,
+  zero corruption.
+- **Zero-capacity namespaces are skipped** in unit discovery: an
+  NSZE=0 namespace previously appeared as a unit on which every access
+  failed with IOERR_BADADDRESS.
+- **LOG SENSE 0x2F refreshes the SMART cache** like the ATA path —
+  previously a tool whose first health query was LOG SENSE got zeros.
+
+Infra: `.gitattributes` (LF normalization — the Kicklayout lesson),
+GitHub Actions workflow building both flavours in the public
+walkero/amigagccondocker image with a zero-warnings gate.
+
 Findings that were NOT driver bugs:
 
 - The initial SAM460ex "hang" reproduced with v1.66 and even with no
