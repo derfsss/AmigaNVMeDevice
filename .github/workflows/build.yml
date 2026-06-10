@@ -1,0 +1,30 @@
+name: build
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (release + debug + tools)
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src \
+              walkero/amigagccondocker:os4-gcc11 \
+              sh -c "make clean && make -j$(nproc) all" 2>&1 | tee build.log
+          test -f build/nvme.device
+          ! grep -iE '(warning|error)[: ]' build.log
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: nvme.device-${{ github.sha }}
+          path: |
+            build/nvme.device
+            build/nvme.device.debug
+            build/test_nvme
+            build/nvme_stats

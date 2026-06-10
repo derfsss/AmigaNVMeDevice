@@ -1,0 +1,10 @@
+# Normalize all text files to LF in the repository.  This matters more
+# than usual here: AmigaOS Kickstart loaders reject CRLF in Kicklayout /
+# diskboot.config, and the build runs in a Linux container.
+* text=auto eol=lf
+
+# Definitely binary
+*.lha binary
+*.img binary
+*.raw binary
+*.qcow2 binary
