@@ -1,5 +1,49 @@
 # nvme.device — Changelog
 
+## Session 13 — 2026-06-10 (afternoon)
+
+### QEMU amigaone root-caused and fixed: half-programmed 64-bit BAR0
+
+The driver "cleanly declining" on QEMU's amigaone machine (assumed to
+be the documented real-Articia-S MMIO limitation) turned out to be
+fixable.  Evidence chain:
+
+1. QEMU source (identical in v10.2.2 and v11.0.1): the Articia model
+   maps an identity PCI memory window at CPU 0x80000000–0xFCFFFFFF
+   plus a low window at 0xFD000000 — **QEMU forwards MMIO fine**; the
+   "Articia can't do MMIO" rule is real-silicon behaviour only.  The
+   PCI bus has no IOMMU, so bus-master DMA is identity-mapped guest
+   RAM, same as Pegasos2.
+2. Debug-driver trace: class scan finds the controller, AmigaOS
+   reports BAR0 Base=0x84208000 (inside the window), but CAP_LO reads
+   0x00000000 — the QEMU "unassigned address" value.
+3. QEMU `info pci` (via QMP against the live guest): **"BAR0:
+   64 bit memory at 0xffffffff84208000"**.  AmigaOS's AmigaOne
+   expansion.library sizes the 64-bit BAR by writing all-ones to both
+   dwords, then writes its assignment back to the LOW dword only — the
+   HIGH dword keeps the 0xFFFFFFFF sizing pattern, so the device
+   decodes at 0xFFFFFFFF_84208000 and CPU reads hit open bus.
+   (The virtio devices' 64-bit *prefetchable* BARs on the same bus are
+   programmed correctly — the bug is specific to how that OS handles
+   non-prefetchable 64-bit BAR0.)
+
+Fix (`pci_discovery.c`): when BAR0 is a 64-bit memory BAR and its high
+dword is non-zero — never a legitimate assignment on a 32-bit host —
+write 0 to PCI_BASE_ADDRESS_1 before the MMIO probe.
+
+Result on QEMU amigaone: CAP_LO=0x0F0107FF, full init, IRQ-driven mode
+on vector 25, and the complete functional suite passes **26/26**
+(including the 6 MiB chunked DMA path, TRIM, SMART, and the WCE
+toggle).  So-called "amigaone DMA copy issue": DMA was never the
+problem.
+
+Also corrected the platform table: the Articia S host bridge is VID
+0x10CC DID 0x0660 (as modelled by QEMU from real hardware), not the
+1647:0001 the table previously listed — platform detection now
+actually identifies AmigaOne machines.  The warning text now
+distinguishes real silicon (MMIO expected to fail, probe gates it)
+from emulators (fully functional).
+
 ## Session 12 — 2026-06-10
 
 ### v1.67 — Real-hardware readiness + chunked-path correctness

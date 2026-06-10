@@ -36,12 +36,15 @@ static const struct BridgeEntry bridge_table[] = {
     /* Pegasos II — Marvell Discovery-II (MV64361) system controller. */
     { 0x11AB, 0x6460, NVME_PLATFORM_PEGASOS2,    "Pegasos II (MV64361)"     },
 
-    /* AmigaOne XE / SE / micro — Mai Logic Articia S.
-     * NOTE: the Articia S does NOT forward CPU memory cycles to PCI
-     * memory BARs, so any MMIO-only device (NVMe, modern VirtIO) will
-     * fail the probe below.  The platform tag is recorded for the
-     * diagnostic message only. */
-    { 0x1647, 0x0001, NVME_PLATFORM_AMIGAONE_XE, "AmigaOne XE (Articia S)"  },
+    /* AmigaOne XE / SE / micro — Mai Logic Articia S (VID 0x10CC).
+     * NOTE: REAL Articia S silicon does not reliably forward CPU memory
+     * cycles to PCI memory BARs, so MMIO-only devices are expected to
+     * fail the probe below on real boards.  Emulators (QEMU's amigaone
+     * machine) forward MMIO fine and the driver is fully functional
+     * there once the half-programmed 64-bit BAR is repaired in
+     * pci_discovery.c.  The platform tag is diagnostic only — the MMIO
+     * probe remains the authoritative gate either way. */
+    { 0x10CC, 0x0660, NVME_PLATFORM_AMIGAONE_XE, "AmigaOne XE (Articia S)"  },
 
     /* Sam440ep / Sam460ex — AMCC / Applied Micro 440EP / 460EX SoC PCIe.
      * Different core IDs; both report as AMCC (0x10E8) host bridge. */

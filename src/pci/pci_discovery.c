@@ -44,8 +44,10 @@ BOOL DiscoverNVMe(struct NVMeBase *devBase)
     /* One-time platform identification. */
     devBase->platform = NVMe_PlatformDetect(IExec, IPCI);
     if (devBase->platform == NVME_PLATFORM_AMIGAONE_XE) {
-        DLOG(IExec, "[nvme.device:pci] WARNING: AmigaOne XE Articia S does"
-                    " not forward PCI MMIO — NVMe init is expected to fail.\n");
+        DLOG(IExec, "[nvme.device:pci] NOTE: real AmigaOne XE Articia S"
+                    " silicon does not forward PCI MMIO reliably — init is"
+                    " expected to fail on real boards (emulators are fine;"
+                    " the MMIO probe decides).\n");
     }
 
     devBase->num_controllers = 0;
@@ -79,6 +81,27 @@ BOOL DiscoverNVMe(struct NVMeBase *devBase)
         cmd |= PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER;
         cmd &= (UWORD)~PCI_COMMAND_INT_DISABLE;
         dev->WriteConfigWord(PCI_COMMAND, cmd);
+
+        /* Repair a half-programmed 64-bit BAR0.  NVMe BAR0 is a 64-bit
+         * memory BAR (type bits 0b10x).  Some platforms' BAR assignment
+         * sizes the BAR by writing all-ones to both halves but writes
+         * the chosen address back to the LOW dword only, leaving the
+         * HIGH dword stuck at 0xFFFFFFFF — the device then decodes at
+         * 0xFFFFFFFF_xxxxxxxx and every MMIO read returns open-bus.
+         * Observed with AmigaOS 4.1 on the AmigaOne (Articia S): QEMU's
+         * `info pci` shows "BAR0: 64 bit memory at 0xffffffff84208000".
+         * On a 32-bit host a non-zero high dword can never be a real
+         * assignment, so zeroing it is always the right repair. */
+        ULONG bar0_lo = dev->ReadConfigLong(PCI_BASE_ADDRESS_0);
+        if ((bar0_lo & 0x7u) == 0x4u) {   /* memory BAR, 64-bit type */
+            ULONG bar0_hi = dev->ReadConfigLong(PCI_BASE_ADDRESS_1);
+            if (bar0_hi != 0) {
+                DLOG(IExec, "[nvme.device:pci] ctrl %lu (%04x:%04x): 64-bit"
+                            " BAR0 high dword=0x%08lx — repairing to 0\n",
+                     ctrl->ctrl_idx, vid, did, bar0_hi);
+                dev->WriteConfigLong(PCI_BASE_ADDRESS_1, 0);
+            }
+        }
 
         ctrl->bar0 = dev->GetResourceRange(0);
         if (!ctrl->bar0) {

@@ -55,12 +55,13 @@ cleanly and the system boots normally.
 |---|---|---|
 | QEMU Pegasos2 | Marvell MV64361 | Tested end-to-end, boots from NVMe |
 | QEMU SAM460ex | AMCC 460EX | Tested end-to-end |
+| QEMU AmigaOne | Mai Logic Articia S (emulated) | Tested end-to-end (driver repairs the OS's half-programmed 64-bit BAR) |
 | Pegasos II | Marvell MV64361 | Expected to work (same bridge as QEMU) |
 | Sam440ep / Sam460ex | AMCC 440EP / 460EX | Expected to work |
 | AmigaOne X1000 | PA6T "Nemo" | Expected to work |
 | AmigaOne X5000 | QorIQ P5020/P5040 | Expected to work |
 | A1222 "Tabor" | QorIQ P1022 | Expected to work |
-| AmigaOne XE / SE | Mai Logic Articia S | **Not supported** — the bridge does not forward MMIO; the driver detects this and aborts init cleanly |
+| AmigaOne XE / SE (real hardware) | Mai Logic Articia S | **Not expected to work** — real Articia silicon does not forward MMIO reliably; the driver detects this at the probe and aborts init cleanly |
 
 "Expected to work" platforms use the same runtime-detected code paths
 validated under QEMU; they await confirmation on real hardware.
