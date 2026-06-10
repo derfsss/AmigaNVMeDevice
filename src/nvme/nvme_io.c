@@ -162,6 +162,22 @@ LONG NVMeIO_SubmitNoRing(struct NVMeBase *devBase, struct NVMeUnit *unit,
         byte_offset = (uint64)ioreq->io_Offset;
     }
 
+    /* Reject anything not block-aligned rather than silently rounding:
+     * a truncated nlb would report io_Actual == io_Length for a partial
+     * transfer, which a filesystem has no way to detect. */
+    ULONG block_mask = unit->block_size - 1;
+    if ((ULONG)(byte_offset & block_mask) != 0) {
+        ioreq->io_Error  = IOERR_BADADDRESS;
+        ioreq->io_Actual = 0;
+        return -5;
+    }
+    if ((byte_length & block_mask) != 0 ||
+        (byte_length != 0 && ioreq->io_Data == NULL)) {
+        ioreq->io_Error  = IOERR_BADLENGTH;
+        ioreq->io_Actual = 0;
+        return -5;
+    }
+
     uint64 start_lba = byte_offset >> unit->block_shift;
     ULONG nlb        = (byte_length >> unit->block_shift); /* block count */
     if (nlb == 0) {

@@ -21,8 +21,21 @@
 #include <exec/exec.h>
 #include <exec/memory.h>
 
-/* Busy-poll CSTS.RDY with ~5 s timeout (iterations at ~1µs each on fast PPC) */
+/* Busy-poll CSTS.RDY floor (iterations at roughly 1 µs each — every
+ * pass is a guarded, cache-inhibited MMIO read, so it cannot run much
+ * faster than the bus round-trip even on a fast CPU).  The actual
+ * budget is scaled by CAP.TO below: real-silicon controllers may
+ * legitimately take many seconds to come ready after an enable. */
 #define NVME_READY_POLL_ITERS  5000000UL
+
+/* Per-CAP.TO ready budget: TO is in 500 ms units; at ~1 µs per MMIO
+ * poll, one TO unit needs ~500k iterations.  Double it for margin. */
+static ULONG ready_poll_budget(ULONG cap_lo)
+{
+    ULONG to = NVME_CAP_TO(cap_lo);
+    ULONG scaled = (to + 1) * 1000000UL;
+    return (scaled > NVME_READY_POLL_ITERS) ? scaled : NVME_READY_POLL_ITERS;
+}
 
 BOOL InitNVMe(struct NVMeController *ctrl)
 {
@@ -50,20 +63,36 @@ BOOL InitNVMe(struct NVMeController *ctrl)
     ULONG mpsmin = NVME_CAP_MPSMIN_HI(cap_hi);
     ctrl->page_size = 4096u << mpsmin;
 
+    /* Per-controller I/O queue depth: our compile-time depth, clamped
+     * to what the controller actually supports.  The inflight pipeline
+     * keys cids 1..NVME_MAX_INFLIGHT to SQ slots, so the queue must be
+     * strictly deeper than the inflight count or the SQ could fill. */
+    ctrl->io_queue_depth = (ctrl->cap_mqes < NVME_IO_QUEUE_DEPTH)
+                         ? (UWORD)ctrl->cap_mqes : NVME_IO_QUEUE_DEPTH;
+    if (ctrl->io_queue_depth <= NVME_MAX_INFLIGHT) {
+        DLOG(IExec, "[nvme.device:init] ctrl %lu: MQES=%lu too shallow for"
+                    " %u inflight slots — rejecting controller\n",
+             ctrl->ctrl_idx, ctrl->cap_mqes, NVME_MAX_INFLIGHT);
+        return FALSE;
+    }
+
+    ULONG ready_iters = ready_poll_budget(cap_lo);
+
     DLOG(IExec, "[nvme.device:init] ctrl %lu CAP: MQES=%lu DSTRD=%lu"
-                " MPSMIN=%lu page_size=%lu\n",
-         ctrl->ctrl_idx, ctrl->cap_mqes, ctrl->cap_dstrd, mpsmin, ctrl->page_size);
+                " MPSMIN=%lu page_size=%lu io_qdepth=%u TO=%lu\n",
+         ctrl->ctrl_idx, ctrl->cap_mqes, ctrl->cap_dstrd, mpsmin,
+         ctrl->page_size, ctrl->io_queue_depth, NVME_CAP_TO(cap_lo));
 
     /* 2. Disable controller, wait CSTS.RDY=0. */
     ULONG cc = NVME_R32(base, NULL, NVME_REG_CC);
     if (cc & NVME_CC_EN) {
         NVME_W32(base, NULL, NVME_REG_CC, cc & ~NVME_CC_EN);
         ULONG i;
-        for (i = 0; i < NVME_READY_POLL_ITERS; i++) {
+        for (i = 0; i < ready_iters; i++) {
             if (!(NVME_R32(base, NULL, NVME_REG_CSTS) & NVME_CSTS_RDY))
                 break;
         }
-        if (i == NVME_READY_POLL_ITERS) {
+        if (i == ready_iters) {
             DLOG(IExec, "[nvme.device:init] ctrl %lu: CSTS.RDY=0 timeout\n",
                  ctrl->ctrl_idx);
             goto err;
@@ -135,13 +164,16 @@ BOOL InitNVMe(struct NVMeController *ctrl)
              NVME_AQA_ASQS(NVME_ADMIN_QUEUE_DEPTH) |
              NVME_AQA_ACQS(NVME_ADMIN_QUEUE_DEPTH));
 
-    /* 4. Enable controller. */
-    NVME_W32(base, NULL, NVME_REG_CC, NVME_CC_DEFAULT | NVME_CC_EN);
+    /* 4. Enable controller.  CC.MPS must encode the page size we are
+     * actually using; NVME_CC_DEFAULT bakes in MPS(0) (4 KiB), which a
+     * controller whose CAP.MPSMIN > 0 would reject at enable time. */
+    NVME_W32(base, NULL, NVME_REG_CC,
+             NVME_CC_DEFAULT | NVME_CC_MPS(mpsmin) | NVME_CC_EN);
 
     /* 5. Wait CSTS.RDY=1; abort on CFS. */
     {
         ULONG i;
-        for (i = 0; i < NVME_READY_POLL_ITERS; i++) {
+        for (i = 0; i < ready_iters; i++) {
             ULONG csts = NVME_R32(base, NULL, NVME_REG_CSTS);
             if (csts & NVME_CSTS_CFS) {
                 DLOG(IExec, "[nvme.device:init] ctrl %lu: CSTS.CFS during enable\n",
@@ -150,7 +182,7 @@ BOOL InitNVMe(struct NVMeController *ctrl)
             }
             if (csts & NVME_CSTS_RDY) break;
         }
-        if (i == NVME_READY_POLL_ITERS) {
+        if (i == ready_iters) {
             DLOG(IExec, "[nvme.device:init] ctrl %lu: CSTS.RDY=1 timeout\n",
                  ctrl->ctrl_idx);
             goto err;

@@ -352,7 +352,7 @@ BOOL NVMe_CreateIOCQ(struct NVMeController *ctrl, struct NVMeUnit *unit)
     memset(&sqe, 0, sizeof(sqe));
     sqe.cdw0    = NVME_ADMIN_CREATE_CQ;
     sqe.prp1_lo = unit->io_cq_phys;
-    sqe.cdw10   = ((ULONG)(NVME_IO_QUEUE_DEPTH - 1) << 16) | unit->queue_id;
+    sqe.cdw10   = ((ULONG)(unit->queue_depth - 1) << 16) | unit->queue_id;
     sqe.cdw11   = NVME_CQ_FLAGS_PC;  /* IEN=0: polling-style; PC=1 */
 
     IExec->ObtainSemaphore(&ctrl->io_lock);
@@ -375,7 +375,7 @@ BOOL NVMe_CreateIOSQ(struct NVMeController *ctrl, struct NVMeUnit *unit)
     memset(&sqe, 0, sizeof(sqe));
     sqe.cdw0    = NVME_ADMIN_CREATE_SQ;
     sqe.prp1_lo = unit->io_sq_phys;
-    sqe.cdw10   = ((ULONG)(NVME_IO_QUEUE_DEPTH - 1) << 16) | unit->queue_id;
+    sqe.cdw10   = ((ULONG)(unit->queue_depth - 1) << 16) | unit->queue_id;
     sqe.cdw11   = NVME_SQ_FLAGS_PC | NVME_SQ_PRIO_LOW |
                   ((ULONG)unit->queue_id << 16);
 

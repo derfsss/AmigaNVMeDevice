@@ -64,7 +64,7 @@ ULONG DiscoverUnits(struct NVMeController *ctrl)
         unit->unit_num    = devBase->num_global_units;  /* flat numbering */
         unit->nsid        = nsids[i];
         unit->queue_id    = (UWORD)(ctrl->num_units + 1);  /* 1-based, local */
-        unit->queue_depth = NVME_IO_QUEUE_DEPTH;
+        unit->queue_depth = ctrl->io_queue_depth;  /* MQES-clamped in InitNVMe */
         unit->ctrl        = ctrl;
         unit->dev_base    = devBase;
 
@@ -97,11 +97,29 @@ ULONG DiscoverUnits(struct NVMeController *ctrl)
         }
 
         ULONG sq_ents = IExec->StartDMA(unit->io_sq, sq_bytes, DMA_ReadFromRAM);
+        if (sq_ents == 0) {
+            DLOG(IExec, "[nvme.device:discovery] StartDMA(io_sq) refused"
+                        " for NS %lu\n", nsids[i]);
+            IExec->FreeVec(unit->io_sq); NVME_LEAK_DEC(nvme_leak_vec);
+            IExec->FreeVec(unit->io_cq); NVME_LEAK_DEC(nvme_leak_vec);
+            IExec->FreeVec(unit);        NVME_LEAK_DEC(nvme_leak_vec);
+            continue;
+        }
         NVME_LEAK_INC(nvme_leak_dma);
         struct DMAEntry *sq_dma = IExec->AllocSysObjectTags(ASOT_DMAENTRY,
             ASODMAE_NumEntries, sq_ents, TAG_DONE);
         if (sq_dma) NVME_LEAK_INC(nvme_leak_dmaentry);
         ULONG cq_ents = IExec->StartDMA(unit->io_cq, cq_bytes, DMA_ReadFromRAM);
+        if (cq_ents == 0) {
+            DLOG(IExec, "[nvme.device:discovery] StartDMA(io_cq) refused"
+                        " for NS %lu\n", nsids[i]);
+            if (sq_dma) { IExec->FreeSysObject(ASOT_DMAENTRY, sq_dma); NVME_LEAK_DEC(nvme_leak_dmaentry); }
+            IExec->EndDMA(unit->io_sq, sq_bytes, DMA_ReadFromRAM); NVME_LEAK_DEC(nvme_leak_dma);
+            IExec->FreeVec(unit->io_sq); NVME_LEAK_DEC(nvme_leak_vec);
+            IExec->FreeVec(unit->io_cq); NVME_LEAK_DEC(nvme_leak_vec);
+            IExec->FreeVec(unit);        NVME_LEAK_DEC(nvme_leak_vec);
+            continue;
+        }
         NVME_LEAK_INC(nvme_leak_dma);
         struct DMAEntry *cq_dma = IExec->AllocSysObjectTags(ASOT_DMAENTRY,
             ASODMAE_NumEntries, cq_ents, TAG_DONE);

@@ -1,5 +1,83 @@
 # nvme.device — Changelog
 
+## Session 12 — 2026-06-10
+
+### v1.67 — Real-hardware readiness + chunked-path correctness
+
+Full code-review pass with one goal: make the driver work on **any**
+AmigaOS 4.1 installation with **any** NVMe SSD, and guarantee a clean
+no-op when no NVMe hardware is present.
+
+Hardware-enablement changes:
+
+- **PCI class-code discovery** (`pci_discovery.c`): controllers are now
+  matched on class 0x01 / subclass 0x08 / progif 0x02 via
+  `FDT_Class`/`FDT_ClassMask` (same pattern as usb2's HCD scan) instead
+  of QEMU's hardcoded `1B36:0010` vendor/device pair.  Every real
+  Samsung/WD/Kingston/etc. SSD is now found; QEMU's controller still
+  matches because it reports the same class triple.  The real VID/DID
+  is read from config space for diagnostics.
+- **CC.MPS honours CAP.MPSMIN** (`nvme_init.c`): `NVME_CC_DEFAULT`
+  bakes in MPS(0); a controller with MPSMIN > 0 would have refused the
+  enable.  The enable write now ORs in `NVME_CC_MPS(mpsmin)`.
+- **Ready-poll budget scales with CAP.TO**: real silicon may take many
+  seconds to come ready; the fixed 5M-iteration poll now grows to
+  `(TO+1) × 1M` iterations when CAP.TO demands it.
+- **I/O queue depth clamped to CAP.MQES**: a controller with
+  MQES+1 < 64 no longer fails Create CQ/SQ; depth is clamped
+  per-controller (and the controller is rejected outright if it cannot
+  cover the 16 inflight slots + 1).
+- **PCI INTx-disable bit cleared** at device enable — some firmwares
+  leave it set, which would have silently killed INTx delivery.
+- **BAR0 size sanity check** (≥ 0x2000) before the MMIO probe.
+- **SCSI INQUIRY reports real Identify data**: vendor "NVMe", product
+  = Identify model number, revision = firmware revision; VPD 0x80
+  serial = controller serial + namespace suffix; VPD 0x83 T10
+  designator built from the model.  Multi-digit NSIDs now format
+  correctly.
+
+Correctness fixes:
+
+- **Chunked (>MDTS) path could swallow an unrelated IORequest**: the
+  per-chunk completion wait redirected `mn_ReplyPort` to the unit's own
+  port and discarded the reply with `GetMsg` — but `GetMsg` pops the
+  port HEAD, which could be a *new* request that arrived mid-chunk,
+  hanging its caller forever.  The path now uses the same
+  `suppress_reply` mechanism as `NVMeIO_SubmitAndWait`; no port
+  juggling, no message loss.  The poll loop also gained the
+  Forbid/Permit yield (QEMU TCG needs the guest to yield to post CQEs)
+  and the timeout path now releases the slot's direct-DMA pin and
+  fixes the inflight counter instead of leaking both.
+- **Block-alignment validation** in `NVMeIO_SubmitNoRing`: misaligned
+  io_Offset / io_Length used to truncate silently to whole blocks while
+  still reporting `io_Actual == io_Length`; they are now rejected with
+  `IOERR_BADADDRESS` / `IOERR_BADLENGTH`.  NULL io_Data with a non-zero
+  length is rejected too.
+- **Expunge teardown order**: controllers are quiesced (IRQ removed,
+  CC.SHN shutdown completed) *before* the unit I/O CQ/SQ backing pages
+  are freed — previously a still-enabled controller could in principle
+  DMA into freed memory.
+- **`StartDMA` return values checked** in `unit_discovery.c` (a zero
+  entry count previously flowed into `AllocSysObjectTags`/`GetDMAList`).
+- NULL `scsi_Data` guards added to INQUIRY and READ CAPACITY(10)/(16).
+
+Verified via AmigaQemuTests on Pegasos2 (new project configs
+`AmigaNVMeDevice.json` / `AmigaNVMeDevice_NoDevice.json`):
+
+- With `-device nvme`: full `test_nvme` functional suite — **0 failed**
+  (banner v1.67, discovery, geometry, read, write+verify, 64 KiB
+  round-trip, TD_READ64 high-offset on the 5 GB image).
+- Without any NVMe device: Kickstart loads the module, Init finds no
+  controllers, unwinds and returns NULL; the system boots normally and
+  all standard DOS tests pass.  `OpenDevice("nvme.device")` fails
+  cleanly as expected.
+
+Note for future sessions: the "AVT_Clear does not clear" gotcha in
+CLAUDE.md is wrong — `exec/exectags.h` defines `AVT_Clear`,
+`AVT_ClearWithValue`, and `AVT_ClearValue` as the *same* tag
+(TAG_USER+6), so `AVT_Clear, 0` and `AVT_ClearWithValue, 0` are
+identical.
+
 ## Session 11 — 2026-04-12 (night)
 
 ### v1.66 — SCSI feature surface expanded: TRIM, RC16, SYNC CACHE, MODE 0x08

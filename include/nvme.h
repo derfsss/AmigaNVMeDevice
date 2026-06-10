@@ -51,6 +51,7 @@
 /* CAP_LO */
 #define NVME_CAP_MQES(cap_lo)   ((cap_lo) & 0xFFFF)           /* max queue entries - 1 */
 #define NVME_CAP_DSTRD(cap_lo)  (((cap_lo) >> 20) & 0xF)      /* doorbell stride */
+#define NVME_CAP_TO(cap_lo)     (((cap_lo) >> 24) & 0xFF)     /* worst-case ready timeout, 500 ms units */
 #define NVME_CAP_MPSMIN(cap_lo) (((cap_lo) >> 21) & 0xF)      /* NOTE: in CAP_HI bits [7:4] */
 
 /* CAP_HI */

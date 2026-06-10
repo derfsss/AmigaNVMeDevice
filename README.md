@@ -4,7 +4,19 @@ Native AmigaOS 4.1 Final Edition block-device driver for NVMe controllers
 on PCIe.  A single binary runs on every AmigaOS 4.1 FE platform with a
 working PCIe bridge.
 
-**Current release: v1.66 (2026-04-12)** — SCSI feature-surface
+**Current release: v1.67 (2026-06-10)** — real-hardware readiness pass.
+Controllers are now matched by **PCI class code** (0x010802), so any
+vendor's NVMe SSD is discovered — not just QEMU's emulated controller.
+`CC.MPS` honours `CAP.MPSMIN`, ready-poll budgets scale with `CAP.TO`,
+the I/O queue depth is clamped to `CAP.MQES`, the PCI INTx-disable bit
+is cleared at enable, and SCSI INQUIRY reports the drive's real
+Identify model/serial/firmware.  Also fixes a chunked-transfer (>MDTS)
+path bug that could silently swallow an IORequest queued mid-chunk,
+and adds block-alignment validation on the I/O path.  If no NVMe
+device is present the driver aborts its init cleanly and the system
+boots normally (verified in QEMU both with and without a controller).
+
+**v1.66 (2026-04-12)** — SCSI feature-surface
 expansion on top of the v1.65 performance pass.  New commands:
 UNMAP (TRIM) via NVMe Dataset Management — **first NVMe TRIM
 implementation in the Amiga ecosystem**; SYNCHRONIZE CACHE(10); READ

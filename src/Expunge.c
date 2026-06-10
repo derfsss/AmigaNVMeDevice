@@ -41,15 +41,30 @@ BPTR _manager_Expunge(struct DeviceManagerInterface *Self)
     seglist = devBase->dev_SegList;
     IExec->Remove((struct Node *)devBase);
 
-    /* Shut down every unit task, free its I/O SQ/CQ backing, and
-     * release the unit struct.  Walk the flat table since that's the
-     * definitive enumeration. */
+    /* Shut down every unit task first so nothing submits new I/O. */
+    for (ULONG u = 0; u < devBase->num_global_units; u++) {
+        struct NVMeUnit *unit = devBase->global_units[u];
+        if (unit)
+            UnitTask_Shutdown(devBase, unit);
+    }
+
+    /* Quiesce every controller BEFORE freeing the unit queue memory:
+     * RemoveNVMeInterrupt masks INTx, CleanupNVMe requests a normal
+     * NVMe shutdown (CC.SHN) and waits for SHST=complete.  Until that
+     * point the controller may still DMA into the I/O CQs, so the
+     * backing pages must stay mapped. */
+    for (ULONG c = 0; c < devBase->num_controllers; c++) {
+        RemoveNVMeInterrupt(&devBase->controllers[c]);
+        CleanupNVMe(&devBase->controllers[c]);
+    }
+
+    /* Free each unit's I/O SQ/CQ backing and release the unit struct.
+     * Walk the flat table since that's the definitive enumeration. */
     ULONG sq_bytes = NVME_IO_QUEUE_DEPTH * NVME_SQE_SIZE;
     ULONG cq_bytes = NVME_IO_QUEUE_DEPTH * NVME_CQE_SIZE;
     for (ULONG u = 0; u < devBase->num_global_units; u++) {
         struct NVMeUnit *unit = devBase->global_units[u];
         if (!unit) continue;
-        UnitTask_Shutdown(devBase, unit);
 
         if (unit->io_sq) {
             IExec->EndDMA(unit->io_sq, sq_bytes, DMA_ReadFromRAM);
@@ -72,12 +87,10 @@ BPTR _manager_Expunge(struct DeviceManagerInterface *Self)
     }
     devBase->num_global_units = 0;
 
-    /* Per-controller IRQ + admin teardown + PCI resource release. */
+    /* Per-controller PCI resource release (IRQ + admin teardown already
+     * happened in the quiesce loop above). */
     for (ULONG c = 0; c < devBase->num_controllers; c++) {
         struct NVMeController *ctrl = &devBase->controllers[c];
-
-        RemoveNVMeInterrupt(ctrl);
-        CleanupNVMe(ctrl);
 
         if (ctrl->pciDevice) {
             if (ctrl->bar0) {

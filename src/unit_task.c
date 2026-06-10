@@ -65,6 +65,25 @@ static inline void fill_auto_sense(struct SCSICmd *scsiCmd, UBYTE sense_key,
 
 #define SCSI_SENSE_ILLEGAL_REQUEST NVME_SSK_ILLEGAL_REQUEST
 
+/* Copy a NUL-terminated identify string into a fixed-width SCSI field,
+ * space-padding the tail (SPC requires ASCII fields padded with 0x20). */
+static void scsi_pad_copy(UBYTE *dst, const char *src, ULONG width)
+{
+    ULONG i = 0;
+    while (i < width && src[i] != '\0') { dst[i] = (UBYTE)src[i]; i++; }
+    while (i < width) dst[i++] = ' ';
+}
+
+/* Append an unsigned decimal to a byte buffer; returns chars written. */
+static ULONG fmt_ulong(UBYTE *dst, ULONG v)
+{
+    UBYTE tmp[10];
+    ULONG n = 0;
+    do { tmp[n++] = (UBYTE)('0' + v % 10u); v /= 10u; } while (v);
+    for (ULONG i = 0; i < n; i++) dst[i] = tmp[n - 1 - i];
+    return n;
+}
+
 static void handle_scsi_cmd(struct NVMeBase *devBase, struct NVMeUnit *unit,
                             struct IOStdReq *ioreq)
 {
@@ -104,6 +123,14 @@ static void handle_scsi_cmd(struct NVMeBase *devBase, struct NVMeUnit *unit,
         UBYTE page = cdb[2];
         UBYTE *buf = (UBYTE *)scsiCmd->scsi_Data;
         ULONG alloc_len = scsiCmd->scsi_Length;
+        struct NVMeController *ctrl = unit->ctrl;
+
+        if (!buf || alloc_len == 0) {
+            scsiCmd->scsi_Status = 2; /* CHECK CONDITION */
+            fill_auto_sense(scsiCmd, SCSI_SENSE_ILLEGAL_REQUEST, 0x24, 0x00);
+            ioreq->io_Error = HFERR_BadStatus;
+            return;
+        }
 
         if (evpd) {
             /* VPD pages */
@@ -124,21 +151,25 @@ static void handle_scsi_cmd(struct NVMeBase *devBase, struct NVMeUnit *unit,
                 ioreq->io_Error = 0;
                 return;
             }
-            case 0x80: { /* Unit Serial Number */
-                UBYTE resp[24];
+            case 0x80: { /* Unit Serial Number — real controller serial
+                          * from Identify, suffixed with the namespace
+                          * so multi-NS controllers stay distinct. */
+                UBYTE resp[40];
                 memset(resp, 0, sizeof(resp));
                 resp[0] = 0x00; /* device type */
                 resp[1] = 0x80; /* page code */
-                /* Serial: "NVME-NS<nsid>" */
-                char serial[16];
-                int slen = 0;
-                serial[slen++] = 'N'; serial[slen++] = 'V';
-                serial[slen++] = 'M'; serial[slen++] = 'E';
-                serial[slen++] = '-'; serial[slen++] = 'N';
-                serial[slen++] = 'S';
-                serial[slen++] = '0' + (char)(unit->nsid % 10);
+                ULONG slen = 0;
+                const char *sn = (ctrl->serial[0] != '\0') ? ctrl->serial
+                                                           : "NVME";
+                while (sn[slen] != '\0' && slen < 20) {
+                    resp[4 + slen] = (UBYTE)sn[slen];
+                    slen++;
+                }
+                resp[4 + slen++] = '-';
+                resp[4 + slen++] = 'N';
+                resp[4 + slen++] = 'S';
+                slen += fmt_ulong(&resp[4 + slen], unit->nsid);
                 resp[3] = (UBYTE)slen;
-                memcpy(&resp[4], serial, slen);
                 ULONG total = 4 + slen;
                 ULONG copy = alloc_len < total ? alloc_len : total;
                 memcpy(buf, resp, copy);
@@ -147,11 +178,16 @@ static void handle_scsi_cmd(struct NVMeBase *devBase, struct NVMeUnit *unit,
                 ioreq->io_Error = 0;
                 return;
             }
-            case 0x83: { /* Device Identification */
-                char id[] = "QEMU    NVMe            NS0";
-                id[sizeof(id)-2] = '0' + (char)(unit->nsid % 10);
-                ULONG idlen = (ULONG)(sizeof(id) - 1);
-                UBYTE resp[48];
+            case 0x83: { /* Device Identification — T10 vendor-ID
+                          * designator built from the Identify model. */
+                UBYTE id[40];
+                scsi_pad_copy(&id[0], "NVMe    ", 8);   /* T10 vendor */
+                scsi_pad_copy(&id[8], ctrl->model, 16); /* vendor-specific */
+                ULONG idlen = 24;
+                id[idlen++] = 'N';
+                id[idlen++] = 'S';
+                idlen += fmt_ulong(&id[idlen], unit->nsid);
+                UBYTE resp[56];
                 memset(resp, 0, sizeof(resp));
                 resp[0] = 0x00;
                 resp[1] = 0x83;
@@ -178,7 +214,10 @@ static void handle_scsi_cmd(struct NVMeBase *devBase, struct NVMeUnit *unit,
             }
         }
 
-        /* Standard INQUIRY — synthesize from NVMe identify data */
+        /* Standard INQUIRY — synthesized from the controller's real
+         * Identify data so Media Toolbox / HDToolbox show the actual
+         * drive.  Vendor "NVMe" follows the SCSI-to-NVMe translation
+         * convention; product is the Identify model number. */
         UBYTE resp[36];
         memset(resp, 0, sizeof(resp));
         resp[0] = 0x00;  /* peripheral: direct access block device */
@@ -187,11 +226,14 @@ static void handle_scsi_cmd(struct NVMeBase *devBase, struct NVMeUnit *unit,
         resp[3] = 0x02;  /* response data format */
         resp[4] = 31;    /* additional length */
         /* Vendor (bytes 8-15) */
-        memcpy(&resp[8],  "QEMU    ", 8);
-        /* Product (bytes 16-31) */
-        memcpy(&resp[16], "NVMe Disk       ", 16);
-        /* Revision (bytes 32-35) */
-        memcpy(&resp[32], "1.0 ", 4);
+        scsi_pad_copy(&resp[8], "NVMe", 8);
+        /* Product (bytes 16-31) — Identify MN, "NVMe Disk" if empty */
+        scsi_pad_copy(&resp[16],
+                      (ctrl->model[0] != '\0') ? ctrl->model : "NVMe Disk",
+                      16);
+        /* Revision (bytes 32-35) — Identify firmware revision */
+        scsi_pad_copy(&resp[32],
+                      (ctrl->fw_rev[0] != '\0') ? ctrl->fw_rev : "1.0", 4);
 
         ULONG copy = alloc_len < 36 ? alloc_len : 36;
         memcpy(buf, resp, copy);
@@ -225,7 +267,7 @@ static void handle_scsi_cmd(struct NVMeBase *devBase, struct NVMeUnit *unit,
         return;
 
     case 0x25: { /* READ CAPACITY (10) */
-        if (scsiCmd->scsi_Length < 8) {
+        if (!scsiCmd->scsi_Data || scsiCmd->scsi_Length < 8) {
             scsiCmd->scsi_Status = 2;
             ioreq->io_Error = HFERR_BadStatus;
             return;
@@ -263,7 +305,7 @@ static void handle_scsi_cmd(struct NVMeBase *devBase, struct NVMeUnit *unit,
             ioreq->io_Error = HFERR_BadStatus;
             return;
         }
-        if (scsiCmd->scsi_Length < 32) {
+        if (!scsiCmd->scsi_Data || scsiCmd->scsi_Length < 32) {
             scsiCmd->scsi_Status = 2;
             ioreq->io_Error = HFERR_BadStatus;
             return;
@@ -410,19 +452,6 @@ static void dispatch_rw(struct NVMeBase *devBase, struct NVMeUnit *unit,
             break;
         }
 
-        /* Poll-harvest until this chunk completes.
-         * Submit sets inflight[slot].ioreq = ioreq;
-         * Harvest clears it and calls ReplyMsg.
-         * But we DON'T want ReplyMsg yet — we want to continue chunking.
-         *
-         * Trick: temporarily NULL the mn_ReplyPort so ReplyMsg is a no-op,
-         * then restore it after. Actually, simpler: we'll check if
-         * inflight slot is free (ioreq cleared) as our completion signal.
-         * The issue is Harvest calls ReplyMsg... we need to prevent that.
-         *
-         * Better approach: find which slot has our ioreq and poll until
-         * it's cleared. We intercept the reply by using a flag. */
-
         /* Find which slot has this ioreq */
         LONG slot = -1;
         for (int i = 0; i < NVME_MAX_INFLIGHT; i++) {
@@ -438,34 +467,53 @@ static void dispatch_rw(struct NVMeBase *devBase, struct NVMeUnit *unit,
             break;
         }
 
-        /* Redirect reply to our own port so ReplyMsg doesn't go back
-         * to the caller yet. We'll consume it here. */
-        struct MsgPort *real_port = ioreq->io_Message.mn_ReplyPort;
-        ioreq->io_Message.mn_ReplyPort = unit->io_port;
+        /* Suppress the normal ReplyMsg for this chunk: we synchronously
+         * poll-harvest the slot from inside the unit task, exactly like
+         * NVMeIO_SubmitAndWait does, and reply the IORequest ourselves
+         * once all chunks are done.  (An earlier version redirected
+         * mn_ReplyPort to unit->io_port and discarded a message with
+         * GetMsg — but GetMsg pops the port HEAD, which could be an
+         * unrelated IORequest that arrived mid-chunk, silently losing
+         * it and hanging its caller.)  Harvest only ever runs on this
+         * task, so setting the flag after Submit is race-free. */
+        unit->inflight[slot].suppress_reply = TRUE;
 
-        /* Spin-poll until Harvest consumes this slot.
-         * Unmask INTMC each iteration in case the ISR masked INTMS
-         * during the poll — without this, subsequent chunks may
-         * never complete if the ISR swallowed the interrupt. */
+        /* Poll-harvest until Harvest consumes this slot.  Yield via
+         * Forbid/Permit between passes (under QEMU TCG the device
+         * emulation needs the guest CPU to yield before it can post
+         * the CQE) and re-unmask INTMC in case the ISR masked INTMS
+         * during the poll. */
         for (LONG poll = 0; poll < 5000000; poll++) {
             NVMeIO_Harvest(devBase, unit);
             if (unit->inflight[slot].ioreq == NULL)
                 break;
             if (unit->ctrl->irq_installed)
                 nvme_w32(unit->ctrl->iobase + NVME_REG_INTMC, 1);
+            IExec->Forbid();
+            IExec->Permit();
         }
-
-        /* Consume the replied message from our own port */
-        if (unit->inflight[slot].ioreq == NULL) {
-            IExec->GetMsg(unit->io_port); /* discard — it's our ioreq */
-        }
-
-        /* Restore the reply port */
-        ioreq->io_Message.mn_ReplyPort = real_port;
 
         if (unit->inflight[slot].ioreq != NULL) {
-            /* Timeout — command stuck */
-            unit->inflight[slot].ioreq = NULL;
+            /* Timeout — command stuck.  Release the slot together with
+             * any direct-DMA pin it still holds, or the user buffer
+             * stays cache-inhibited forever. */
+            struct NVMeInflight *inf = &unit->inflight[slot];
+            if (!inf->use_bounce && inf->dma_list) {
+                BOOL  is_pool   = (inf->dma_flags & 0x80000000u) != 0;
+                ULONG end_flags = inf->dma_flags & ~0x80000000u;
+                IExec->EndDMA(inf->dma_buf, inf->dma_size, end_flags);
+                NVME_LEAK_DEC(nvme_leak_dma);
+                if (!is_pool) {
+                    IExec->FreeSysObject(ASOT_DMAENTRY, inf->dma_list);
+                    NVME_LEAK_DEC(nvme_leak_dmaentry);
+                }
+                inf->dma_list = NULL;
+            }
+            inf->suppress_reply = FALSE;
+            inf->ioreq = NULL;
+            if (unit->stats.inflight_current > 0)
+                unit->stats.inflight_current--;
+            unit->stats.err_timeout++;
             ioreq->io_Error = IOERR_ABORTED;
             break;
         }

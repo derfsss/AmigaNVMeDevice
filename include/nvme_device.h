@@ -196,6 +196,7 @@ struct NVMeController {
     ULONG                    cap_dstrd;     /* doorbell stride exponent */
     ULONG                    page_size;     /* host page size */
     ULONG                    max_transfer_bytes;  /* MDTS-derived cap */
+    UWORD                    io_queue_depth; /* min(NVME_IO_QUEUE_DEPTH, MQES+1) */
 
     /* Admin SQ/CQ pair (one per controller). */
     APTR                     admin_sq;
