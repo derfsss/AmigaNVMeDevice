@@ -82,23 +82,25 @@ BOOL DiscoverNVMe(struct NVMeBase *devBase)
         cmd &= (UWORD)~PCI_COMMAND_INT_DISABLE;
         dev->WriteConfigWord(PCI_COMMAND, cmd);
 
-        /* Repair a half-programmed 64-bit BAR0.  NVMe BAR0 is a 64-bit
-         * memory BAR (type bits 0b10x).  Some platforms' BAR assignment
-         * sizes the BAR by writing all-ones to both halves but writes
-         * the chosen address back to the LOW dword only, leaving the
-         * HIGH dword stuck at 0xFFFFFFFF — the device then decodes at
-         * 0xFFFFFFFF_xxxxxxxx and every MMIO read returns open-bus.
-         * Observed with AmigaOS 4.1 on the AmigaOne (Articia S): QEMU's
-         * `info pci` shows "BAR0: 64 bit memory at 0xffffffff84208000".
-         * On a 32-bit host a non-zero high dword can never be a real
-         * assignment, so zeroing it is always the right repair. */
+        /* AmigaOne PCI probe bug — same workaround virtioscsi.device
+         * ships.  The AmigaOne's PCI enumeration does not understand
+         * 64-bit BARs: it sizes the high dword as if it were an
+         * independent 32-bit BAR (writes 0xFFFFFFFF, reads all-ones
+         * back) and never assigns it, while the chosen address is
+         * written to the LOW dword only.  The device then decodes at
+         * 0xFFFFFFFF_xxxxxxxx and every MMIO read returns open bus —
+         * a config-access trace shows the OS doing exactly this to
+         * NVMe BAR0 (which is a 64-bit memory BAR, type bits 0b10x).
+         * Zero the leftover sizing pattern so the device decodes at
+         * the address the OS actually assigned. */
         ULONG bar0_lo = dev->ReadConfigLong(PCI_BASE_ADDRESS_0);
         if ((bar0_lo & 0x7u) == 0x4u) {   /* memory BAR, 64-bit type */
             ULONG bar0_hi = dev->ReadConfigLong(PCI_BASE_ADDRESS_1);
-            if (bar0_hi != 0) {
-                DLOG(IExec, "[nvme.device:pci] ctrl %lu (%04x:%04x): 64-bit"
-                            " BAR0 high dword=0x%08lx — repairing to 0\n",
-                     ctrl->ctrl_idx, vid, did, bar0_hi);
+            if (bar0_hi == 0xFFFFFFFFu) {
+                DLOG(IExec, "[nvme.device:pci] ctrl %lu (%04x:%04x): BAR0"
+                            " high dword is 0xFFFFFFFF (AmigaOne PCI probe"
+                            " bug), zeroing\n",
+                     ctrl->ctrl_idx, vid, did);
                 dev->WriteConfigLong(PCI_BASE_ADDRESS_1, 0);
             }
         }
