@@ -53,8 +53,8 @@ UWORD NVMe_AdminCmd(struct NVMeController *ctrl, struct nvme_sqe *sqe)
     /* CRITICAL: mask admin interrupt (vector 0) for the duration of this
      * admin command.  We poll the admin CQ ourselves; we don't want an
      * IRQ to fire when the device posts the CQE.  On a shared level-
-     * triggered INTx line (Pegasos2: nvme + virtioscsi + ide share the
-     * same line), our ISR — which only inspects I/O CQs — correctly
+     * triggered INTx line (on Pegasos2 several PCI devices share one
+     * line), our ISR — which only inspects I/O CQs — correctly
      * returns "not ours" for an admin CQE.  No handler in the chain
      * claims, the line stays asserted, exec calls the chain again, and
      * so on: instant IRQ storm / hard-freeze.  Masking INTMS bit 0 at

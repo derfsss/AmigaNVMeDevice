@@ -87,8 +87,8 @@ FEATURES
    log page refresh on demand.
  - MMU cache-inhibit + guarded MMU attributes on BAR0 for correct
    MMIO behaviour on real hardware.
- - Boot-drive compatible (resident priority 0 matches
-   virtioscsi.device).
+ - Boot-drive compatible (resident priority 0, same as the
+   system disk drivers).
  - Release build emits only the startup banner on the serial
    console during normal operation.  Verbose trace lives in the
    debug build which is drop-in compatible.
@@ -103,8 +103,9 @@ ARCHIVE CONTENTS
                          nvme.device to swap it in for debugging.
   test_nvme              Smoke-test program.  Exercises OpenDevice,
                          INQUIRY, geometry, read, write, 64 KiB
-                         round-trip verify and TD_READ64 at a high
-                         offset.
+                         round-trip verify, TD_READ64 at a high
+                         offset, a 6 MiB transfer through the
+                         chunking path, and misalignment rejection.
   nvme_stats             CLI monitor for the live statistics
                          interface.  Usage:
                            nvme_stats                one unit 0 snap

@@ -869,7 +869,7 @@ BOOL UnitTask_Start(struct NVMeBase *devBase, struct NVMeUnit *unit)
      * the unit task — StartDMA at task startup, no EndDMA until
      * shutdown.  This was v1.47's pattern and it is known-good on
      * QEMU Pegasos2.  The alternative (EndDMA with DMAF_NoModify +
-     * explicit CacheClearE in nvme_io.c) as used by virtioscsi.device
+     * explicit CacheClearE in nvme_io.c)
      * turned out to cause I/O hangs on the first CMD_READ — the exact
      * cache-attribute state after DMAF_NoModify is not sufficiently
      * predictable across the bridge + MMU interaction on this

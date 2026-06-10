@@ -1,9 +1,9 @@
 /*
  * nvme_mmu.c — MMU attribute helpers for NVMe BAR regions.
  *
- * See include/nvme_mmu.h for the rationale.  This is a direct adaptation
- * of the VirtIOGPU `chip_immu_setup_bar` pattern, which itself was taken
- * from RadeonRX.chip (0x101ab54) and pa6t_eth.device.
+ * See include/nvme_mmu.h for the rationale.  This follows the standard
+ * AmigaOS 4 chip-driver pattern for making a memory BAR safe for MMIO:
+ * mark the region cache-inhibited and guarded before the first access.
  */
 
 #include "nvme_mmu.h"

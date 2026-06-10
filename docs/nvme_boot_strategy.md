@@ -29,24 +29,31 @@ with the driver exists.
 ### Step 1 — Build nvme.device
 
 ```sh
-# From WSL2 (two separate docker calls):
-wsl sh -c "docker run --rm -v /mnt/w/Code/amiga/antigravity:/src -w /src/projects/AmigaNVMeDevice walkero/amigagccondocker:os4-gcc11 make clean"
-wsl sh -c "docker run --rm -v /mnt/w/Code/amiga/antigravity:/src -w /src/projects/AmigaNVMeDevice walkero/amigagccondocker:os4-gcc11 make -j\$(nproc) all"
+docker run --rm -v "$(pwd):/src" -w /src \
+    walkero/amigagccondocker:os4-gcc11 \
+    sh -c "make clean && make -j$(nproc) all"
 ```
 
 Output: `build/nvme.device`
 
 ### Step 2 — Add nvme.device to kickstart.zip
 
-Use the PowerShell update script to replace the driver in the Pegasos2 kickstart.zip:
+Unpack kickstart.zip, add `nvme.device` to the `Kickstart/` folder, add
+a `MODULE Kickstart/nvme.device` line to `Kickstart/Kicklayout`, ensure
+`Kickstart/diskboot.config` has an `nvme.device` entry, and repack:
 
-```powershell
-# From Windows (after copying build/nvme.device to S:\temp\):
-powershell -File S:\temp\update_peg2_zip.ps1
+```sh
+mkdir ks && cd ks
+unzip ../kickstart.zip
+cp ../build/nvme.device Kickstart/
+echo "MODULE Kickstart/nvme.device" >> Kickstart/Kicklayout
+# add "nvme.device 1 1" to Kickstart/diskboot.config
+# (see diskboot.config.sample), then:
+zip -r ../kickstart.zip .
 ```
 
-Or manually: unpack kickstart.zip, add `nvme.device` to the `Kickstart/`
-folder, add an entry to `Kickstart/kicklayout`, and repack.
+Note: keep LF line endings in Kicklayout and diskboot.config — some
+second-stage loaders reject CRLF.
 
 ### Step 3 — Create NVMe disk image
 
@@ -93,8 +100,8 @@ Notes:
 - The NVMe drive holds SYS: (the full AmigaOS installation)
 - `serial=amiga-nvme-0` sets the NVMe controller serial number (visible in Identify Controller)
 - Multiple NVMe drives can be attached: add another `-device nvme,...` + `-drive ...`
-- For testing, add a VVFAT share with diskboot.config:
-  `-drive file=fat:rw:S:/temp/,format=vvfat,if=none,id=vvfat -device virtio-blk-pci,drive=vvfat`
+- For testing, a VVFAT share of a host directory is convenient:
+  `-drive file=fat:rw:/path/to/share,format=vvfat,if=none,id=vvfat -device virtio-blk-pci,drive=vvfat`
 
 ### Multiple NVMe controllers
 

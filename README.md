@@ -1,238 +1,264 @@
-# nvme.device — AmigaOS 4.1 NVMe Device Driver
+# nvme.device — NVMe Driver for AmigaOS 4.1
 
-Native AmigaOS 4.1 Final Edition block-device driver for NVMe controllers
-on PCIe.  A single binary runs on every AmigaOS 4.1 FE platform with a
-working PCIe bridge.
+A native AmigaOS 4.1 Final Edition block-device driver for NVMe SSDs on
+PCIe.  One binary supports every AmigaOS 4.1 FE platform whose PCI/PCIe
+bridge forwards CPU memory cycles, and exposes each NVMe namespace as a
+standard trackdisk-compatible unit that can be partitioned, formatted,
+mounted — and booted from.
 
-**Current release: v1.67 (2026-06-10)** — real-hardware readiness pass.
-Controllers are now matched by **PCI class code** (0x010802), so any
-vendor's NVMe SSD is discovered — not just QEMU's emulated controller.
-`CC.MPS` honours `CAP.MPSMIN`, ready-poll budgets scale with `CAP.TO`,
-the I/O queue depth is clamped to `CAP.MQES`, the PCI INTx-disable bit
-is cleared at enable, and SCSI INQUIRY reports the drive's real
-Identify model/serial/firmware.  Also fixes a chunked-transfer (>MDTS)
-path bug that could silently swallow an IORequest queued mid-chunk,
-and adds block-alignment validation on the I/O path.  If no NVMe
-device is present the driver aborts its init cleanly and the system
-boots normally (verified in QEMU both with and without a controller).
+NVMe controllers are discovered by PCI class code (`0x010802`), so any
+vendor's drive is found without a device-ID table.  The driver reads
+the controller's capabilities (`CAP.MPSMIN`, `CAP.MQES`, `CAP.TO`,
+MDTS) and adapts its page size, queue depths, and timeouts to the
+hardware.  If no NVMe device is present, the driver declines to load
+cleanly and the system boots normally.
 
-**v1.66 (2026-04-12)** — SCSI feature-surface
-expansion on top of the v1.65 performance pass.  New commands:
-UNMAP (TRIM) via NVMe Dataset Management — **first NVMe TRIM
-implementation in the Amiga ecosystem**; SYNCHRONIZE CACHE(10); READ
-CAPACITY(16); MODE SENSE/SELECT page 0x08 (Caching — Volatile Write
-Cache toggle).  End-to-end validated on QEMU Pegasos2 (boots to DOS,
-partitioned, SFS/00 formatted, SMART via `HD_SCSICMD` ATA PASS-
-THROUGH, v1.65 benchmark wins carried forward).
+## Highlights
 
-## Status
+- **Boots AmigaOS from NVMe** — resident Kickstart module, priority 0,
+  recognised by `diskboot.kmod` as a boot-drive candidate
+- **Multi-controller, multi-namespace** — up to 4 controllers ×
+  8 namespaces (32 units), flat unit numbering
+- **512-byte and 4K-native namespaces** — logical block size taken from
+  Identify Namespace, honoured throughout the I/O path
+- **Asynchronous I/O pipeline** — 16 in-flight commands per unit, served
+  by a per-unit task; doorbell writes batched across bursts
+- **Adaptive DMA strategy** — small or unaligned transfers go through
+  pre-pinned bounce buffers; aligned medium/large transfers use direct
+  DMA on the caller's buffer with a pre-allocated scatter-gather pool
+- **Full PRP support** — PRP1 / PRP2 / PRP-list construction up to 2 MiB
+  per command, with transparent chunking above the controller's MDTS
+- **TRIM** — SCSI UNMAP translated to NVMe Dataset Management
+  (Deallocate), the first native NVMe TRIM for AmigaOS 4.1
+- **64-bit addressing** — `TD_READ64`/`TD_WRITE64` and the complete NSD
+  64-bit command set; namespaces beyond 4 GiB fully usable
+- **HD_SCSICMD synthesis** — INQUIRY (with the drive's real model,
+  serial, and firmware from Identify), READ CAPACITY(10/16),
+  SYNCHRONIZE CACHE(10), MODE SENSE/SELECT page 0x08 (write-cache
+  toggle via NVMe Set Features), LOG SENSE, and ATA PASS-THROUGH SMART
+- **Live SMART telemetry** — NVMe health log translated to ATA SMART
+  attributes on demand, so existing SMART-aware tools (e.g.
+  AmigaDiskBench's SMART tab) work unmodified
+- **Statistics interface** — `NSCMD_NVME_GETSTATS` returns per-unit
+  command counts, byte totals, latency, path hits, and SMART fields;
+  the bundled `nvme_stats` CLI displays them
+- **Interrupt-driven with polling fallback** — per-controller INTx ISR
+  that behaves correctly on shared interrupt lines; systems without a
+  usable interrupt run in polling mode automatically
+- **Quiet in production** — the release build prints a one-line startup
+  banner and nothing else; a verbose debug build (`nvme.device.debug`)
+  is a drop-in swap
 
-All 16 commits of the modernization plan (`docs/modernization_plan.md`)
-are implemented, plus v1.56–v1.61 post-modernization bug-fixes, the
-v1.62 structural perf sweep, the v1.65 perf polish (`IExec->CopyMem`,
-MDTS 2 MiB), and the v1.66 SCSI feature expansion.  See
-`docs/history.md` Session 10 for the design exploration and two
-dead-ends (unsafe pin cache, harmful hybrid-poll) that didn't ship,
-and Session 11 for the v1.66 feature work.
+## Supported platforms
 
-## Platforms
+| Platform | Bridge | Status |
+|---|---|---|
+| QEMU Pegasos2 | Marvell MV64361 | Tested end-to-end, boots from NVMe |
+| QEMU SAM460ex | AMCC 460EX | Tested end-to-end |
+| Pegasos II | Marvell MV64361 | Expected to work (same bridge as QEMU) |
+| Sam440ep / Sam460ex | AMCC 440EP / 460EX | Expected to work |
+| AmigaOne X1000 | PA6T "Nemo" | Expected to work |
+| AmigaOne X5000 | QorIQ P5020/P5040 | Expected to work |
+| A1222 "Tabor" | QorIQ P1022 | Expected to work |
+| AmigaOne XE / SE | Mai Logic Articia S | **Not supported** — the bridge does not forward MMIO; the driver detects this and aborts init cleanly |
 
-One binary, runtime-detected:
+"Expected to work" platforms use the same runtime-detected code paths
+validated under QEMU; they await confirmation on real hardware.
 
-| Platform        | Bridge              | Status |
-|-----------------|---------------------|--------|
-| QEMU Pegasos2   | MV64361             | **Tested end-to-end** |
-| Pegasos II      | MV64361             | Should work — same bridge as QEMU |
-| Sam440ep        | AMCC 440EP          | Expected to work |
-| Sam460ex        | AMCC 460EX          | Expected to work |
-| X1000           | PA6T Nemo           | Expected to work |
-| X5000           | QorIQ P5020 / P5040 | Expected to work |
-| A1222 "Tabor"   | QorIQ P1022         | Expected to work |
-| AmigaOne 500    | -                   | Expected to work |
-| AmigaOne XE/SE  | Mai Logic Articia S | **Unsupported** — bridge does not forward MMIO; driver aborts cleanly |
+## Requirements
 
-## Features
+- AmigaOS 4.1 Final Edition
+- An NVMe controller reachable over PCI/PCIe (class code `0x010802`)
+- For booting from NVMe: a boot environment that loads Kickstart
+  modules before disk access (see `docs/nvme_boot_strategy.md`)
 
-- **Multi-controller**: up to 4 NVMe devices × 8 namespaces each (32 units total)
-- **Async I/O pipeline**: NVME_MAX_INFLIGHT=16 slots per unit, per-unit I/O task
-- **Shared INTx handling** with per-controller ISR + yield-poll fallback
-- **Alignment-aware DMA path selection (v1.62)**: bounce for small/unaligned transfers, direct DMA for aligned medium+large transfers — skips the memcpy whenever the user buffer is page-aligned
-- **Pre-allocated DMAEntry pool (v1.62)**: one DMAEntry array per inflight slot, sized for worst-case physical fragmentation — eliminates `AllocSysObjectTags`/`FreeSysObject` from the direct-DMA hot path
-- **Batched SQ doorbell writes (v1.62)**: `NVMeIO_SubmitNoRing` + `NVMeIO_RingSQ` let the event loop collapse a burst of N submissions into a single doorbell write
-- **`IExec->CopyMem` on bounce path (v1.65)**: replaces compat.c's byte-by-byte memcpy on bounce fills / copy-backs; biggest single-cell wins on HeavyLifter (+8 %) and on 4 KiB–64 KiB writes that stay on the bounce
-- **MDTS soft-cap 2 MiB (v1.65)**: larger single-command capacity when the controller advertises MDTS=0, bounded by our single-PRP-list-page capacity
-- **64 KiB pre-pinned bounce buffer** per inflight slot, full PRP1/PRP2/PRP-list support
-- **MDTS chunking** for transfers > controller max
-- **TD_READ64/WRITE64** and every NSD 64-bit command
-- **HD_SCSICMD synthesis**: INQUIRY, READ CAPACITY 10 / 16, SYNCHRONIZE CACHE 10, MODE SENSE/SELECT page 0x08 (Caching), UNMAP (TRIM), and **ATA PASS-THROUGH SMART** — AmigaDiskBench's SMART tab displays live NVMe telemetry translated into ATA attribute format
-- **TRIM (v1.66)** via SCSI UNMAP → NVMe Dataset Management with AD=1 — first NVMe TRIM implementation for AmigaOS 4.1
-- **LOG SENSE** page 0x00 / 0x2F for SPC-4 health-reporting tools
-- **Write-cache toggle (v1.66)** via SCSI Mode Page 0x08 → NVMe Feature 0x06 Set Features
-- **Live statistics** via `NSCMD_NVME_GETSTATS (0xA100)` — byte counts, latencies, per-path hits, SMART.  CLI monitor `nvme_stats` bundled
-- **Debug build coexists with release** — `nvme.device.debug` is swap-in with zero behaviour change except verbose serial logging
-- **Resident priority 0** (boot-drive compatible, matches `virtioscsi.device`)
-- **MMU cache-inhibit + guarded** on BAR0 for correct MMIO on real hardware
-- **Startup banner** is the only always-on serial output; release build emits nothing else during normal operation
+## Installation
+
+1. Copy `nvme.device` into `SYS:Kickstart/` (or into the `Kickstart/`
+   drawer of your Kickstart image for QEMU setups).
+2. Add a line to the Kicklayout in use:
+
+   ```
+   MODULE Kickstart/nvme.device
+   ```
+
+3. Add an entry to `Kickstart/diskboot.config` so `diskboot.kmod`
+   scans the device for bootable partitions:
+
+   ```
+   nvme.device 1 1
+   ```
+
+   (`1 1` = one unit, mount as hard disk.  Raise the unit count for
+   multi-namespace or multi-controller setups — see
+   `diskboot.config.sample`.)
+
+4. Reboot.  Namespaces appear as `nvme.device` units 0…n and can be
+   partitioned with Media Toolbox as usual.
+
+Alternatively, for non-boot use the driver can simply be placed in
+`DEVS:` and is loaded on first `OpenDevice()`.
 
 ## Building
 
-Via Docker from WSL2 or any Linux host:
+The driver builds with the AmigaOS 4 gcc 11 cross-toolchain.  The
+simplest route is the publicly available Docker image
+[`walkero/amigagccondocker`](https://hub.docker.com/r/walkero/amigagccondocker):
 
 ```sh
-docker run --rm -v /mnt/w/Code/amiga/antigravity:/src \
-    -w /src/projects/AmigaNVMeDevice \
+docker run --rm -v "$(pwd):/src" -w /src \
     walkero/amigagccondocker:os4-gcc11 \
     sh -c "make clean && make -j$(nproc) all"
 ```
-
-Targets:
 
 | make target | produces |
 |---|---|
 | `make` / `make all` | release + debug drivers, `test_nvme`, `nvme_stats` |
 | `make release` | release only (`build/nvme.device`) |
 | `make debug` | debug only (`build/nvme.device.debug`) |
-| `make deploy` | copy release to `$(DEPLOY_DIR)` (default `/mnt/s/temp`) |
-| `make deploy-debug` | deploy debug binary (lands as `nvme.device`) |
-| `make dist` | stage release+debug+readme+AutoInstall in `build/dist/nvme/` |
-| `make dist-lha` | wrap the staging dir as `build/nvme.lha` (AmiUpdate-ready) |
+| `make deploy` | copy release binaries to `$(DEPLOY_DIR)` (default `./deploy`) |
+| `make dist` | stage a release drawer in `build/dist/nvme/` |
+| `make dist-lha` | pack the staging drawer as `build/nvme.lha` |
 | `make clean` | remove `build/` |
 
-Optional compile flags:
+Optional flags: `NO_SMART=1` drops the SMART log-page path;
+`DEPLOY_DIR=…` redirects deploy copies.
 
-- `make NO_SMART=1 …` — build without SMART log-page refresh.
-- `DEPLOY_DIR=/other/path make deploy` — redirect deploy copies.
+## Trying it on QEMU
 
-## Quick start on QEMU Pegasos2
+QEMU's `pegasos2` machine plus its standard `nvme` device model is the
+reference test environment:
 
 ```sh
+qemu-img create -f raw nvme_test.img 5G
+
 qemu-system-ppc -M pegasos2 \
     -kernel bboot \
     -initrd kickstart.zip \
     -device nvme,drive=nvme0,serial=amiga-nvme-0 \
     -drive file=nvme_test.img,if=none,id=nvme0,format=raw \
-    -device virtio-scsi-pci-non-transitional,id=scsi0 \
-    -drive file=virtioscsi_test.img,if=none,id=vd0,format=raw \
-    -device scsi-hd,drive=vd0,bus=scsi0.0,channel=0,scsi-id=0,lun=0 \
+    -device virtio-scsi-pci,id=scsi0 \
     -m 2048M \
     -serial stdio
 ```
 
-`diskboot.config` inside `kickstart.zip/Kickstart/` must contain
-`nvme.device 1 1` or diskboot.kmod won't scan the controller.  See
-`docs/nvme_boot_strategy.md` for the full boot procedure.
+Notes:
 
-## Runtime tools
+- `kickstart.zip` must contain `nvme.device`, a Kicklayout entry, and a
+  `diskboot.config` with an `nvme.device` line (see Installation).
+- `diskboot.kmod` only activates its scan pipeline when it finds at
+  least one controller it recognises, so keep a VirtIO SCSI controller
+  on the command line even with no drives attached.
+- Full details, including booting AmigaOS *from* the NVMe disk, are in
+  `docs/nvme_boot_strategy.md`.
 
-**`nvme_stats`** — CLI snapshot of the live stats interface:
+## Bundled tools
+
+**`test_nvme [unit]`** — 11-step functional test: device query,
+geometry (32- and 64-bit), INQUIRY, single-block and 64 KiB
+round-trips, a 64-bit high-offset read, a 6 MiB transfer that exercises
+the >MDTS chunking path, and negative tests proving misaligned requests
+are rejected.  Prints `PASS`/`FAIL` per step and a summary line.
+
+**`nvme_stats`** — live statistics monitor:
 
 ```
 nvme_stats           # one-shot snapshot of unit 0
 nvme_stats 1         # snapshot of unit 1
-nvme_stats -w 0 2    # watch unit 0, refresh every 2s
+nvme_stats -w 0 2    # watch unit 0, refresh every 2 s
 nvme_stats -s        # one-line summary of every unit
 ```
 
-**`test_nvme`** — 10-step functional tester (INQUIRY, geometry, read,
-write-verify, 64 KiB round-trip, TD_READ64 high-offset, etc.).
+## SMART
 
-**AmigaDiskBench** — works unmodified; SMART tab shows real NVMe data
-thanks to the ATA PASS-THROUGH translation path.
+Two query paths are provided:
 
-## SMART surface
+1. **Native** — `NSCMD_NVME_GETSTATS` (`0xA100`) returns a versioned
+   `struct NVMeStats` (see `include/nvme_stats.h`) with the full NVMe
+   health log plus live driver counters.
+2. **SCSI-ATA translation** — `HD_SCSICMD` ATA PASS-THROUGH (CDB
+   `0x85`/`0xA1`, ATA command `0xB0`, sub-commands `0xD0`/`0xD1`)
+   returns a 512-byte ATA SMART block synthesized from NVMe Log Page
+   `0x02`, covering temperature, power-on hours, power cycles, unsafe
+   shutdowns, media errors, spare capacity, and wear.  LOG SENSE pages
+   `0x00`/`0x2F` are also answered.
 
-The driver publishes SMART data through two mechanisms:
+The in-driver SMART cache refreshes on demand, at most every 30 s.
 
-1. **Custom, native, zero-loss**: `NSCMD_NVME_GETSTATS (0xA100)` returns
-   a `struct NVMeStats` with all NVMe health fields plus live
-   driver counters.  Used by `nvme_stats`.
-2. **SCSI-ATA translation**: `HD_SCSICMD` with CDB opcode `0x85` or `0xA1`
-   (ATA PASS-THROUGH 16 / 12), ATA command `0xB0` (SMART), sub-command
-   `0xD0` (READ DATA) or `0xD1` (READ THRESHOLDS) returns a 512-byte ATA
-   SMART block synthesized live from NVMe Log Page 0x02.  Used by
-   AmigaDiskBench and any SMART tool that speaks SAT.  LOG SENSE (0x4D)
-   pages 0x00 and 0x2F also work.
+## Validation
 
-The in-driver SMART cache refreshes on demand every 30 seconds.
+Continuously tested under QEMU (TCG) with the standard `nvme` device
+model:
 
-## Distribution
-
-`make dist-lha` produces `build/nvme.lha`, an AmiUpdate-ready archive:
-
-```
-nvme/
-├── AutoInstall               (generated from amiupdate.yml)
-├── nvme.device               (release build)
-├── nvme.device.debug         (verbose debug build — optional rename-to-install)
-├── test_nvme                 (10-step functional test)
-├── nvme_stats                (CLI monitor)
-├── nvme.readme               (plain-text end-user docs)
-└── diskboot.config.sample    (example Kickstart: config)
-nvme.readme                   (duplicate at archive root for os4depot)
-```
+- Full functional suite on Pegasos2 and SAM460ex, including 64-bit
+  offsets, >MDTS chunked transfers, and alignment-rejection checks
+- Multi-controller (2 controllers) and multi-namespace configurations,
+  including a 4K-native namespace
+- **Boot from NVMe**: a system disk image attached as the NVMe drive
+  boots to Workbench with no other bootable media present
+- No-hardware case on every machine: the driver aborts init cleanly
+  and the system boots normally
+- AmigaOne XE (Articia S): the driver detects the non-forwarding
+  bridge and declines, leaving the system fully functional
+- Benchmark-validated with AmigaDiskBench; SMART tab shows live NVMe
+  telemetry
 
 ## Source layout
 
 ```
 src/
   device.c              Resident struct, manager interface vectors
-  Init.c                Per-controller init loop, banner, IRQ install,
-                        unit discovery
-  Open.c / Close.c      Unit task lifecycle (lazy start on first open)
-  Expunge.c             Full reverse-order release + leak report
-  BeginIO.c             Command dispatch (inline, held, async, stats)
-  unit_discovery.c      Per-controller namespace enumeration + mounter
-  unit_task.c           Per-unit async I/O task, SCSI dispatch, chunking
+  Init.c                Library init: PCI discovery, per-controller
+                        bring-up, unit discovery
+  Open.c / Close.c      Unit open/close, lazy unit-task lifecycle
+  Expunge.c             Reverse-order teardown + debug leak report
+  BeginIO.c             Command dispatch (inline / held / async / stats)
+  unit_discovery.c      Namespace enumeration + mounter announcement
+  unit_task.c           Per-unit async I/O task, SCSI synthesis,
+                        MDTS chunking
   nvme/
-    nvme_init.c         Controller reset/enable/identify
-    nvme_admin.c        Admin command wrappers + SMART refresh
-    nvme_io.c           I/O submit/harvest + PRP build
-    nvme_irq.c          Per-controller INTx ISR + install/remove
+    nvme_init.c         Controller reset / enable / identify
+    nvme_admin.c        Admin commands + SMART refresh
+    nvme_io.c           I/O submit / harvest, PRP construction
+    nvme_irq.c          Per-controller INTx ISR
   pci/
-    pci_discovery.c     FDT_Index loop over NVMe controllers
-    platform_detect.c   Host bridge table + BAR0 MMIO probe
-  scsi_cmds/
-    scsi_ata_passthrough.c  CDB 0x85/0xA1 → NVMe SMART translation
-    scsi_log_sense.c        CDB 0x4D (pages 0x00 / 0x2F)
-  nvme_mmu.c            BAR0 cache-inhibit + guarded setup
-  nvme_status.c         Unified NVMe-status → io_Error mapper
-  nvme_stats.c          NSCMD_NVME_GETSTATS handler + snapshot builder
-  nvme_leak.c           Debug-only alloc/free counters + Expunge report
-  compat.c              memset/memcpy for -nostartfiles
-include/
-  nvme.h                Register offsets (NVMe 1.4 citations), SQE/CQE
-  nvme_device.h         NVMeBase, NVMeController, NVMeUnit, MMIO helpers
-  nvme_scsi.h           scsi_cmds/ prototypes
-  nvme_admin.h          Admin command prototypes
-  nvme_init.h           Controller init / cleanup
-  nvme_io.h             Submit / flush / harvest
-  nvme_irq.h            IRQ install / remove
-  nvme_stats.h          NVMeStats wire struct + TBR helpers
-  nvme_status.h         Status mapper prototype
-  nvme_mmu.h            MMU helper prototype
-  nvme_leak.h           Debug leak counters
-  nvme_platform.h       Platform enum + MMIO probe prototype
-  nvme_debug.h          DPRINTF macros
-  version.h             DEVNAME / version / build stamp
+    pci_discovery.c     Class-code controller enumeration, BAR0 setup
+    platform_detect.c   Host-bridge identification + MMIO probe
+  scsi_cmds/            HD_SCSICMD handlers (SMART, LOG SENSE, UNMAP,
+                        MODE SENSE/SELECT)
+  nvme_mmu.c            BAR0 cache-inhibit + guarded MMU attributes
+  nvme_status.c         NVMe status → io_Error mapping
+  nvme_stats.c          Statistics snapshot assembly
+  nvme_leak.c           Debug-only resource counters
+  compat.c              Freestanding memset/memcpy (-nostartfiles)
+include/                Public + internal headers (nvme.h carries the
+                        NVMe 1.4 register/section citations)
 tests/
-  test_nvme.c           10-step functional test program
-  nvme_stats.c          CLI monitor for the stats interface
+  test_nvme.c           Functional test program
+  nvme_stats.c          Statistics CLI
 docs/
-  modernization_plan.md The 16-commit plan (authoritative)
-  architecture.md       Architecture + protocol reference
-  nvme_boot_strategy.md QEMU / kickstart.zip boot setup
-  history.md            Session-by-session changelog
-amiupdate.yml           AmiUpdate installer configuration
-nvme.readme             Plain-text readme bundled in the LHA
-diskboot.config.sample  Example Kickstart: diskboot.config entry
+  architecture.md       Architecture and protocol reference
+  nvme_boot_strategy.md Booting AmigaOS with/from NVMe under QEMU
+  modernization_plan.md Development plan (historical)
+  history.md            Detailed development changelog
 ```
+
+## Version history
+
+See `docs/history.md` for the full changelog.  Recent milestones:
+
+- **1.67** — real-hardware readiness: PCI class-code discovery,
+  CAP-derived limits (MPSMIN/MQES/TO), INQUIRY from Identify data,
+  chunked-path fix, block-alignment validation
+- **1.66** — TRIM (UNMAP→DSM), READ CAPACITY(16), SYNCHRONIZE CACHE,
+  write-cache toggle via Mode Page 0x08
+- **1.65** — bounce-path copy optimisation, 2 MiB MDTS cap
+- **1.62** — alignment-aware DMA selection, DMAEntry pooling, doorbell
+  batching
 
 ## References
 
-- NVMe Base Specification 1.4: https://nvmexpress.org/specifications/
-- AmigaOS SDK: `W:/Code/amiga/antigravity/docs/sdk/`
-- Reference drivers:
-  - `../VirtualSCSIDevice/` — virtioscsi.device, same block-driver pattern
-  - `../VirtIOGPU/` — MMIO / MMU / endian patterns
-  - `../Init/` — AmigaOS 4 project conventions
-- AmiUpdate integration: `../AmiUpdateIntegration/`
+- [NVM Express Base Specification 1.4](https://nvmexpress.org/specifications/)
+- [AmigaOS 4.1 SDK](https://www.hyperion-entertainment.com/) (Hyperion Entertainment)
+- [QEMU NVMe device documentation](https://www.qemu.org/docs/master/system/devices/nvme.html)
+- [walkero/amigagccondocker](https://hub.docker.com/r/walkero/amigagccondocker) — AmigaOS 4 cross-compile Docker images

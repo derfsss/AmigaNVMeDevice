@@ -6,7 +6,7 @@
  *   SBC-4  §5.28      UNMAP parameter data (16-byte block descriptors)
  *   NVMe 1.4 §6.7     Dataset Management command
  *
- * The library consumer (e.g. blockdev.library's Trim() / TrimRanges())
+ * The consumer (a filesystem or a TRIM-aware utility issuing UNMAP)
  * hands us a parameter list whose header carries a count of 16-byte
  * block descriptors, each {LBA:8, blocks:4, reserved:4}.  We translate
  * those into NVMe's 16-byte range-descriptor format
@@ -23,8 +23,8 @@
  *     to TRIM).
  *
  * Range-count bound: NVMe caps at NVME_DSM_MAX_RANGES = 256 per command.
- * The caller's list may be shorter; if it's longer we truncate and
- * report BLKDEV_ERROR_NOT_SUPPORTED-equivalent (ILLEGAL REQUEST).
+ * The caller's list may be shorter; if it's longer we reject with
+ * CHECK CONDITION / ILLEGAL REQUEST.
  */
 
 #include "nvme_device.h"

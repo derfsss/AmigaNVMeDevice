@@ -1,24 +1,27 @@
 # ---------------------------------------------------------------------------
 # Makefile — nvme.device for AmigaOS 4.1 Final Edition
 #
-# Two build flavours share this Makefile:
+# Requires the AmigaOS 4 cross-toolchain (ppc-amigaos-gcc).  The easiest
+# way to get one is the public Docker image:
+#
+#   docker run --rm -v "$(pwd):/src" -w /src \
+#       walkero/amigagccondocker:os4-gcc11 sh -c "make clean && make all"
+#
+# Targets:
 #
 #   make          — release build: build/nvme.device, build/test_nvme
-#                   (DPRINTF compiled out; always-on DLOG/banner still fire)
+#                   (DPRINTF compiled out; only the startup banner prints)
 #   make debug    — debug build:   build/nvme.device.debug,
 #                                  build/test_nvme.debug
 #                   (DPRINTF active, banner notes "DEBUG build")
 #   make all      — both of the above in one invocation
 #
-# After building (normally via the walkero/amigagccondocker:os4-gcc11 image
-# under WSL2), copy the chosen flavour to Kickstart staging from the host:
-#
-#   make deploy        — copy release driver + test to $(DEPLOY_DIR)
-#   make deploy-debug  — copy debug driver + test to $(DEPLOY_DIR)
+#   make deploy        — copy release driver + tools to $(DEPLOY_DIR)
+#   make deploy-debug  — copy debug driver + tools to $(DEPLOY_DIR)
 #                        (driver always lands as nvme.device regardless of
-#                        flavour, so kickstart.zip injection is unchanged)
+#                        flavour, so Kickstart staging is unchanged)
 #
-#   DEPLOY_DIR defaults to /mnt/s/temp.  Override with:
+#   DEPLOY_DIR defaults to ./deploy.  Override with:
 #       make deploy DEPLOY_DIR=/some/other/path
 #
 # BUILD_DATE and BUILD_TIME are re-stamped on every compile so the runtime
@@ -57,9 +60,12 @@ DBG_TEST   = $(BUILD_DIR)/test_nvme.debug
 REL_STATS  = $(BUILD_DIR)/nvme_stats
 DBG_STATS  = $(BUILD_DIR)/nvme_stats.debug
 
-DEPLOY_DIR ?= /mnt/s/temp
+DEPLOY_DIR ?= ./deploy
 
-# AmiUpdate integration — dist and dist-lha targets use these.
+# Optional AmiUpdate integration — `make dist` stages an AutoInstall
+# script when an external generator is available at $(AMIUPDATE_DIR);
+# without one the dist drawer is staged with everything else and the
+# AutoInstall step is skipped.
 AMIUPDATE_DIR    ?= ../AmiUpdateIntegration
 AMIUPDATE_CONFIG ?= amiupdate.yml
 DIST_DIR          = $(BUILD_DIR)/dist
@@ -129,14 +135,14 @@ $(DBG_DIR)/%.o: src/%.c
 # Note: deploy targets are plain `cp` and are intended to be run from the
 # host shell (outside Docker) — they do not require the PPC toolchain.
 deploy: $(REL_TARGET) $(REL_TEST) $(REL_STATS)
-	@test -d $(DEPLOY_DIR) || { echo "DEPLOY_DIR $(DEPLOY_DIR) does not exist"; exit 1; }
+	@mkdir -p $(DEPLOY_DIR)
 	cp -f $(REL_TARGET) $(DEPLOY_DIR)/nvme.device
 	cp -f $(REL_TEST)   $(DEPLOY_DIR)/test_nvme
 	cp -f $(REL_STATS)  $(DEPLOY_DIR)/nvme_stats
 	@echo "Deployed release build to $(DEPLOY_DIR)/"
 
 deploy-debug: $(DBG_TARGET) $(DBG_TEST) $(DBG_STATS)
-	@test -d $(DEPLOY_DIR) || { echo "DEPLOY_DIR $(DEPLOY_DIR) does not exist"; exit 1; }
+	@mkdir -p $(DEPLOY_DIR)
 	cp -f $(DBG_TARGET) $(DEPLOY_DIR)/nvme.device
 	cp -f $(DBG_TEST)   $(DEPLOY_DIR)/test_nvme
 	cp -f $(DBG_STATS)  $(DEPLOY_DIR)/nvme_stats
@@ -144,19 +150,26 @@ deploy-debug: $(DBG_TARGET) $(DBG_TEST) $(DBG_STATS)
 
 # Distribution ---------------------------------------------------------------
 #
-# `make dist` stages an AmiUpdate-ready drawer under $(DIST_DIR)/nvme/ —
-# both driver flavours, the test program, the stats monitor, the plain-
-# text readme, a diskboot.config sample, and a generated AutoInstall
-# script (via $(AMIUPDATE_DIR)/generate_autoinstall.py).
+# `make dist` stages a release drawer under $(DIST_DIR)/nvme/ — both
+# driver flavours, the test program, the stats monitor, the plain-text
+# readme, and a diskboot.config sample.  If an AmiUpdate AutoInstall
+# generator is present at $(AMIUPDATE_DIR) it is invoked too; otherwise
+# that step is skipped (the archive works fine without it).
 #
 # `make dist-lha` wraps the staging directory + a copy of the readme at
 # the archive root into an LHA — runs lha inside the toolchain Docker
 # image so it works from any host that can execute docker.
-$(DIST_STAGE)/AutoInstall: $(AMIUPDATE_CONFIG) $(AMIUPDATE_DIR)/generate_autoinstall.py
+.PHONY: autoinstall
+autoinstall:
 	@mkdir -p $(DIST_STAGE)
-	python3 $(AMIUPDATE_DIR)/generate_autoinstall.py $(AMIUPDATE_CONFIG) $@
+	@if [ -f $(AMIUPDATE_DIR)/generate_autoinstall.py ]; then \
+	    python3 $(AMIUPDATE_DIR)/generate_autoinstall.py $(AMIUPDATE_CONFIG) \
+	        $(DIST_STAGE)/AutoInstall; \
+	else \
+	    echo "AutoInstall generator not found at $(AMIUPDATE_DIR) — skipping"; \
+	fi
 
-dist: release debug $(DIST_STAGE)/AutoInstall nvme.readme diskboot.config.sample
+dist: release debug autoinstall nvme.readme diskboot.config.sample
 	@echo "=== Staging distribution tree in $(DIST_DIR) ==="
 	@mkdir -p $(DIST_STAGE)
 	cp -f $(REL_TARGET)             $(DIST_STAGE)/nvme.device

@@ -134,7 +134,7 @@ Findings that were NOT driver bugs:
 ### v1.66 — SCSI feature surface expanded: TRIM, RC16, SYNC CACHE, MODE 0x08
 
 Not a performance commit — a **feature-completeness** commit.  A
-survey of `../AmigaBlockDevLibrary` identified four SCSI sub-commands
+survey of a block-device utility library identified four SCSI sub-commands
 that the library (and any SAT-aware tool) needed from our
 `HD_SCSICMD` surface but which `nvme.device` rejected with CHECK
 CONDITION.  All four are now implemented and dispatched from
@@ -536,8 +536,8 @@ diagnosing future issues but off by default.
 ### Modernization sweep — 16-commit plan landed (v1.47 → v1.55)
 
 Delivered the full plan in `docs/modernization_plan.md` — sixteen
-self-contained commits, each building clean and deploying to
-`s:/temp/` as a sanity check before moving on.
+self-contained commits, each building clean and deploying to the
+staging area as a sanity check before moving on.
 
 **Commit summaries**:
 
@@ -609,7 +609,7 @@ self-contained commits, each building clean and deploying to
     `dist-lha` targets — produces an AmiUpdate-ready `build/nvme.lha`
     containing both driver flavours, test program, stats CLI, plain-
     text readme, diskboot.config sample, and a generated `AutoInstall`
-    script (via `../AmiUpdateIntegration/generate_autoinstall.py`).
+    script (via an external AutoInstall generator, when available).
 
 ### Platform support after the sweep
 
@@ -658,7 +658,7 @@ compile path.
   device in the system. Without one, nvme.device is ignored even if listed in diskboot.config.
   Adding `-device virtio-scsi-pci-non-transitional` (even with no drives) is sufficient.
 - **`diskboot.config` format**: `devicename maxunits flags` (1=HD, 2=CD, 3=both).
-  `nvme.device 1 1` required. File goes in `Devs/` or `S:/temp/` for QEMU VVFAT.
+  `nvme.device 1 1` required. File goes in `Devs/` or a VVFAT share for QEMU.
 - **`struct DriveGeometry64` ≠ `struct DriveGeometry`**: completely different layouts.
   DriveGeometry64 has uint64 fields, no C/H/S. Filling the wrong struct causes mounter
   to read garbage geometry.

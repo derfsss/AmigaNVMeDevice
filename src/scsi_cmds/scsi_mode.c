@@ -5,8 +5,8 @@
  *   SBC-4  §6.4.5    Caching Mode Page
  *   NVMe 1.4 §5.21.1.6   Feature 0x06 — Volatile Write Cache
  *
- * Library consumers (e.g. blockdev.library's GetFeature / SetFeature
- * wrappers) toggle the device's volatile write cache through this
+ * SCSI-aware consumers (filesystem tools, block-device utility
+ * libraries) toggle the device's volatile write cache through this
  * path.  The one bit that matters is WCE (Write Cache Enable, byte 2
  * bit 2 of the Caching page); all other bytes in the page are
  * reported as zero and accepted as zero on write.

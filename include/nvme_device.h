@@ -310,8 +310,7 @@ ULONG                _manager_Release(struct DeviceManagerInterface *Self);
 /* rather than `eieio`.  Under QEMU TCG, `eieio` is known to be too    */
 /* weak to force the store out of the CPU pipeline before the next     */
 /* instruction reads it back; `sync` is architecturally strict enough  */
-/* to be safe on both QEMU and real hardware.  Pattern borrowed from   */
-/* VirtIOGPU after the same problem bit that driver.                   */
+/* to be safe on both QEMU and real hardware.                          */
 /*                                                                      */
 /* DMA buffers (SQE/CQE and PRP data in RAM) are NOT routed through    */
 /* the bridge's endian swap — they travel as raw bytes.  The CPU must  */

@@ -13,10 +13,10 @@
  * The response is a 512-byte ATA SMART Read-Data structure
  * (ATA/ATAPI-8 §7.52) whose attribute entries are built from the live
  * NVMe Health Information Log (NVMe 1.4 §5.14.1.2) cached in
- * ctrl->smart_cache.  Building this at request time gives
- * AmigaDiskBench's SMART tab real data — temperature, power-on hours,
- * power-cycle count, unsafe-shutdown count, spare%, wear% — rather
- * than the canned values virtioscsi.device returns.
+ * ctrl->smart_cache.  Building this at request time gives SMART
+ * viewers (e.g. AmigaDiskBench's SMART tab) real data — temperature,
+ * power-on hours, power-cycle count, unsafe-shutdown count, spare%,
+ * wear% — rather than canned placeholder values.
  *
  * If ENABLE_SMART is not compiled in, the helper falls back to
  * canned values so the tool still gets a plausible response.
@@ -206,8 +206,8 @@ static void build_attrs_from_nvme(struct ATASmartAttr *out,
     } else
 #endif
     {
-        /* Fallback when SMART is unavailable — mirror virtioscsi's
-         * canned block so tools still receive a parseable response. */
+        /* Fallback when SMART is unavailable — a canned attribute
+         * block so tools still receive a parseable response. */
         static const struct ATASmartAttr canned[] = {
             {   9, 0x03, 0x00, 100, 100, {0x01,0,0,0,0,0}, 0 },  /* PoH = 1 */
             {  12, 0x03, 0x00, 100, 100, {0x01,0,0,0,0,0}, 0 },  /* cycles = 1 */

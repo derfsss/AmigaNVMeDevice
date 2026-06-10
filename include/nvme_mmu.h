@@ -17,7 +17,7 @@
  *
  * which, together, make MMIO accesses behave the way a register-level
  * programmer expects on any PPC platform (Pegasos2 MV64361, SAM460ex,
- * X1000, X5000, A1222).  Pattern derived from VirtIOGPU/RadeonRX/pa6t_eth.
+ * X1000, X5000, A1222).
  *
  * This helper is idempotent and safe to call multiple times on the same
  * region; it reads the existing attrs and ORs in CI+G rather than

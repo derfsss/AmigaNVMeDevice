@@ -7,7 +7,7 @@
  * NVMe on QEMU and most consumer SSDs uses level-triggered PCI INTx
  * rather than MSI-X (which the AmigaOS 4 exec does not yet support).
  * The line is shared across PCI devices on most boards (Pegasos2 shares
- * it with virtioscsi, IDE, etc.), so the ISR must positively identify
+ * it with other disk controllers), so the ISR must positively identify
  * that an NVMe CQE is pending before claiming the interrupt — otherwise
  * it swallows interrupts belonging to other drivers.
  *

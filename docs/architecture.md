@@ -7,8 +7,8 @@ NVMe controllers on PCIe.  **A single binary runs on every AmigaOS 4.1 FE
 platform with a working PCIe bridge** — runtime-detected via a host-bridge
 table and a BAR0 MMIO forwarding probe.
 
-It is a single-phase `RTF_COLDSTART` driver (priority 0, matching
-`virtioscsi.device` for boot-drive compatibility).  Multi-controller, up to
+It is a single-phase `RTF_COLDSTART` driver (priority 0, matching the
+system disk drivers for boot-drive compatibility).  Multi-controller, up to
 4 × 8-namespace each (32 flat units).  All NVMe I/O is available immediately
 at boot.
 
@@ -74,8 +74,8 @@ static inline void nvme_w32(ULONG addr, ULONG val) {
 ```c
 RTF_NATIVE | RTF_COLDSTART | RTF_AUTOINIT
 ```
-Priority: `0` (matches virtioscsi.device / disk.device; allows
-`diskboot.kmod` to consider nvme.device as a boot-drive candidate).
+Priority: `0` (matches the system disk drivers, e.g. disk.device;
+allows `diskboot.kmod` to consider nvme.device as a boot-drive candidate).
 
 ### Interface vectors
 ```
