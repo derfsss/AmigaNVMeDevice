@@ -185,6 +185,15 @@ LONG NVMeIO_SubmitNoRing(struct NVMeBase *devBase, struct NVMeUnit *unit,
         ioreq->io_Actual = 0;
         return -2; /* nothing to do */
     }
+    /* CDW12 NLB is a 16-bit zeroes-based field, so 65536 blocks is the
+     * absolute ceiling per command.  The MDTS chunking in dispatch_rw
+     * (2 MiB cap = 4096 blocks at 512 B) keeps real traffic far below
+     * this; reject rather than mask if a future caller bypasses it. */
+    if (nlb > 0x10000UL) {
+        ioreq->io_Error  = IOERR_BADLENGTH;
+        ioreq->io_Actual = 0;
+        return -5;
+    }
 
     struct NVMeInflight *inf = &unit->inflight[slot];
     inf->ioreq    = ioreq;

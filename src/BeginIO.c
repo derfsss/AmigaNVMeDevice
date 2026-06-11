@@ -81,15 +81,35 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOStdReq *iore
     /* ---- Held change-notification commands ---- */
 
     case TD_ADDCHANGEINT:
-        /* NVMe fixed media — hold the request; never fire a change notification */
-        if (unit)
-            unit->changeint_req = ioreq;
+        /* NVMe fixed media — hold the request; never fire a change
+         * notification.  Without a unit there is nowhere to hold it:
+         * reply with an error rather than orphaning the caller. */
+        if (!unit) {
+            ioreq->io_Error = IOERR_OPENFAIL;
+            inline_reply(IExec, ioreq);
+            return;
+        }
+        /* Only one slot: release any previously held request so its
+         * owner isn't orphaned by a silent overwrite. */
+        if (unit->changeint_req) {
+            unit->changeint_req->io_Error = IOERR_ABORTED;
+            IExec->ReplyMsg((struct Message *)unit->changeint_req);
+        }
+        unit->changeint_req = ioreq;
         ioreq->io_Flags &= ~IOF_QUICK;
         return; /* Do NOT reply */
 
     case TD_REMOVE:
-        if (unit)
-            unit->remove_req = ioreq;
+        if (!unit) {
+            ioreq->io_Error = IOERR_OPENFAIL;
+            inline_reply(IExec, ioreq);
+            return;
+        }
+        if (unit->remove_req) {
+            unit->remove_req->io_Error = IOERR_ABORTED;
+            IExec->ReplyMsg((struct Message *)unit->remove_req);
+        }
+        unit->remove_req = ioreq;
         ioreq->io_Flags &= ~IOF_QUICK;
         return; /* Do NOT reply — replied on close/expunge */
 

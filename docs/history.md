@@ -1,5 +1,52 @@
 # nvme.device — Changelog
 
+## Session 14 — 2026-06-11 — v1.68
+
+### Full code review + documentation standardisation
+
+Line-by-line review of every source file (the same review pass that
+produced virtioscsi.device v1.12).  The driver came through almost
+clean — two genuine bugs and one hardening gap, all in the held-command
+and submit paths:
+
+1. **`BeginIO.c` — held-request orphans (`TD_ADDCHANGEINT` /
+   `TD_REMOVE`).**  Two related defects, both in the "held command"
+   path:
+   - With `io_Unit == NULL` the request was neither stored on a unit
+     nor replied — the caller's `WaitIO()` would block forever.  Now
+     replied immediately with `IOERR_OPENFAIL`.
+   - Each unit has exactly one holding slot per command, but a second
+     request silently overwrote the first, orphaning the original
+     caller.  The previously held request is now replied with
+     `IOERR_ABORTED` before the new one is stored.
+
+2. **`nvme_io.c` — explicit NLB ceiling.**  CDW12's NLB field is
+   16-bit zeroes-based, so 65 536 blocks is the per-command maximum;
+   the old code masked (`(nlb - 1) & 0xFFFF`), which would silently
+   wrap a larger request into a short transfer.  Unreachable today
+   (MDTS chunking caps commands at 2 MiB = 4 096 blocks), but a future
+   caller bypassing `dispatch_rw` would corrupt data instead of
+   failing.  Requests above 65 536 blocks are now rejected with
+   `IOERR_BADLENGTH` before submission.
+
+Everything else reviewed clean: `unit_task.c`, `nvme_admin.c`,
+`nvme_init.c`, `nvme_irq.c`, `unit_discovery.c`, all four
+`scsi_cmds/` handlers, `Init/Open/Close/Expunge`, `nvme_stats.c`,
+`nvme_status.c`, `pci_discovery.c`, `platform_detect.c`, `nvme_mmu.c`,
+`nvme_leak.c`, `compat.c`, `device.c`.  Notably `Close.c` already
+releases held requests correctly on last close, and the Expunge
+teardown order (quiesce controller before freeing CQ backing pages)
+is correct.
+
+### Documentation
+
+- `README.md` rebuilt to the standard repo skeleton (Beta status +
+  warning banner, Overview/Features/Requirements/QEMU Setup/
+  Installation/Building/Project Structure/Documentation/Development/
+  License) shared with the other AmigaOS driver repos.
+- `nvme.readme` (os4depot) version-bumped and licence text corrected
+  (it referenced a LICENSE file that doesn't exist in the archive).
+
 ## Session 13 — 2026-06-10 (afternoon)
 
 ### QEMU amigaone root-caused and fixed: half-programmed 64-bit BAR0

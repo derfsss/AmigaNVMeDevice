@@ -2,7 +2,7 @@ Short:        Native NVMe block device driver for AmigaOS 4.1 FE
 Author:       Richard Gibbs
 Uploader:     Richard Gibbs
 Type:         driver/hardware
-Version:      1.67
+Version:      1.68
 Architecture: ppc-amigaos
 
 
@@ -165,7 +165,7 @@ and behave identically at runtime.  The differences are:
 
 Both emit the always-on startup banner:
 
-  [nvme.device] v1.67 build DD.MM.YYYY HH:MM:SS
+  [nvme.device] v1.68 build DD.MM.YYYY HH:MM:SS
 
 so you can always tell which build is loaded.  To switch flavours,
 rename the relevant file to nvme.device in DEVS: (or Kickstart:).
@@ -210,7 +210,16 @@ See the in-archive nvme.readme or the docs/ directory in the source
 repository for the full architecture reference and platform notes.
 
 
+ABOUT
+=====
+
+This project was created with help from ClaudeAI (Anthropic) —
+writing the C code, designing the architecture, and debugging
+hardware-level issues against the AmigaOS 4.1 SDK — with a human
+developer directing, reviewing, and testing the result.
+
+
 LICENCE
 =======
 
-Distributed under the terms of the included LICENSE file.
+Copyright (c) 2026.  All rights reserved.

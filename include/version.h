@@ -12,9 +12,9 @@
 
 #define DEVNAME            "nvme.device"
 #define DEVVER             1
-#define DEVREV             67
-#define DEVVERSIONSTRING   "nvme.device 1.67 (2026-06-10)"
-#define VERSION_LOG_STRING "1.67"
+#define DEVREV             68
+#define DEVVERSIONSTRING   "nvme.device 1.68 (2026-06-11)"
+#define VERSION_LOG_STRING "1.68"
 
 #ifndef BUILD_DATE
 #define BUILD_DATE "unknown"
