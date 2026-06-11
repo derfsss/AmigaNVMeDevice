@@ -64,16 +64,10 @@ REL_PERSIST = $(BUILD_DIR)/persist_nvme
 
 DEPLOY_DIR ?= ./deploy
 
-# Optional AmiUpdate integration — `make dist` stages an AutoInstall
-# script when an external generator is available at $(AMIUPDATE_DIR);
-# without one the dist drawer is staged with everything else and the
-# AutoInstall step is skipped.
-AMIUPDATE_DIR    ?= ../AmiUpdateIntegration
-AMIUPDATE_CONFIG ?= amiupdate.yml
-DIST_DIR          = $(BUILD_DIR)/dist
-DIST_NAME         = nvme
-DIST_STAGE        = $(DIST_DIR)/$(DIST_NAME)
-DIST_LHA          = $(BUILD_DIR)/$(DIST_NAME).lha
+DIST_DIR   = $(BUILD_DIR)/dist
+DIST_NAME  = nvme
+DIST_STAGE = $(DIST_DIR)/$(DIST_NAME)
+DIST_LHA   = $(BUILD_DIR)/$(DIST_NAME).lha
 
 # Docker image used for the LHA packer (lha is not always on the host).
 DOCKER_IMAGE     ?= walkero/amigagccondocker:os4-gcc11
@@ -161,31 +155,22 @@ deploy-debug: $(DBG_TARGET) $(DBG_TEST) $(DBG_STATS)
 # Distribution ---------------------------------------------------------------
 #
 # `make dist` stages a release drawer under $(DIST_DIR)/nvme/ — both
-# driver flavours, the test program, the stats monitor, the plain-text
-# readme, and a diskboot.config sample.  If an AmiUpdate AutoInstall
-# generator is present at $(AMIUPDATE_DIR) it is invoked too; otherwise
-# that step is skipped (the archive works fine without it).
+# driver flavours, the test program, the stats monitor, the Autoinstall
+# script with its Workbench icon (double-clickable; the icon's default
+# tool is C:IconX), the plain-text readme, and a diskboot.config sample.
 #
 # `make dist-lha` wraps the staging directory + a copy of the readme at
-# the archive root into an LHA — runs lha inside the toolchain Docker
-# image so it works from any host that can execute docker.
-.PHONY: autoinstall
-autoinstall:
-	@mkdir -p $(DIST_STAGE)
-	@if [ -f $(AMIUPDATE_DIR)/generate_autoinstall.py ]; then \
-	    python3 $(AMIUPDATE_DIR)/generate_autoinstall.py $(AMIUPDATE_CONFIG) \
-	        $(DIST_STAGE)/AutoInstall; \
-	else \
-	    echo "AutoInstall generator not found at $(AMIUPDATE_DIR) — skipping"; \
-	fi
-
-dist: release debug autoinstall nvme.readme diskboot.config.sample
+# the archive root into an LHA.  Uses host lha when available, otherwise
+# runs lha inside the toolchain Docker image.
+dist: release debug nvme.readme diskboot.config.sample Autoinstall Autoinstall.info
 	@echo "=== Staging distribution tree in $(DIST_DIR) ==="
 	@mkdir -p $(DIST_STAGE)
 	cp -f $(REL_TARGET)             $(DIST_STAGE)/nvme.device
 	cp -f $(DBG_TARGET)             $(DIST_STAGE)/nvme.device.debug
 	cp -f $(REL_TEST)               $(DIST_STAGE)/test_nvme
 	cp -f $(REL_STATS)              $(DIST_STAGE)/nvme_stats
+	cp -f Autoinstall               $(DIST_STAGE)/Autoinstall
+	cp -f Autoinstall.info          $(DIST_STAGE)/Autoinstall.info
 	cp -f nvme.readme               $(DIST_STAGE)/nvme.readme
 	cp -f diskboot.config.sample    $(DIST_STAGE)/diskboot.config.sample
 	cp -f nvme.readme               $(DIST_DIR)/nvme.readme
@@ -198,9 +183,13 @@ dist: release debug autoinstall nvme.readme diskboot.config.sample
 dist-lha: dist
 	@echo "=== Packing $(DIST_LHA) ==="
 	@rm -f $(DIST_LHA)
-	@# Run lha inside Docker so a host without lha installed still works.
-	docker run --rm -v "$(CURDIR):/work" -w /work/$(DIST_DIR) $(DOCKER_IMAGE) \
-	    sh -c 'lha ao5q /work/$(DIST_LHA) $(DIST_NAME) nvme.readme'
+	@if command -v lha >/dev/null 2>&1; then \
+	    (cd $(DIST_DIR) && lha ao5q ../../$(DIST_LHA) $(DIST_NAME) nvme.readme); \
+	else \
+	    echo "lha not on PATH — packing inside Docker"; \
+	    docker run --rm -v "$(CURDIR):/work" -w /work/$(DIST_DIR) $(DOCKER_IMAGE) \
+	        sh -c 'lha ao5q /work/$(DIST_LHA) $(DIST_NAME) nvme.readme'; \
+	fi
 	@ls -la $(DIST_LHA)
 
 clean:

@@ -1,0 +1,68 @@
+; nvme.device Autoinstall
+; Installs the NVMe block device driver for AmigaOS 4.1 Final Edition
+;
+; Double-click the Autoinstall icon in Workbench, or run from a shell
+; in the nvme distribution directory:
+;   Execute Autoinstall
+;
+; Files installed automatically:
+;   DEVS:nvme.device   - NVMe device driver (runtime load)
+;   C:nvme_stats       - live statistics monitor
+;
+; Boot-drive (Kickstart module) installation is a manual step --
+; instructions are printed at the end.
+
+echo ""
+echo "nvme.device -- NVMe driver for AmigaOS 4.1 FE"
+echo "================================================"
+echo ""
+
+; Check the driver file exists in our distribution
+if not exists nvme.device
+  echo "ERROR: nvme.device not found in current directory."
+  echo "Please run this script from the nvme distribution directory."
+  ask "Press RETURN to close this window."
+  quit 20
+endif
+
+echo "Installing nvme.device to DEVS:..."
+copy nvme.device DEVS:nvme.device CLONE QUIET
+if warn
+  echo "ERROR: Failed to copy nvme.device to DEVS:"
+  echo "Check that SYS: is not write-protected."
+  ask "Press RETURN to close this window."
+  quit 20
+endif
+
+if exists nvme_stats
+  echo "Installing nvme_stats to C:..."
+  copy nvme_stats C:nvme_stats CLONE QUIET
+  if warn
+    echo "WARNING: Failed to copy nvme_stats to C: -- skipped."
+  endif
+endif
+
+echo ""
+echo "Installation complete.  The driver loads on first OpenDevice()"
+echo "and namespaces auto-mount via mounter.library."
+echo ""
+echo "================================================"
+echo "OPTIONAL: to BOOT from an NVMe disk, the driver"
+echo "must load as a Kickstart module instead:"
+echo ""
+echo "  1. copy DEVS:nvme.device SYS:Kickstart/nvme.device"
+echo "  2. Add to the Kicklayout in use:"
+echo "       MODULE Kickstart/nvme.device"
+echo "  3. Add to Kickstart/diskboot.config:"
+echo "       nvme.device 1 1"
+echo "     (see diskboot.config.sample in this drawer)"
+echo "  4. Reboot."
+echo ""
+echo "QEMU users: place nvme.device inside kickstart.zip's"
+echo "Kickstart/ drawer instead -- see the project docs."
+echo "================================================"
+echo ""
+
+; Keep the output window readable when launched from the Workbench icon
+; (IconX closes its console as soon as the script ends).
+ask "Press RETURN to close this window."

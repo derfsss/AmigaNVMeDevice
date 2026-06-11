@@ -115,7 +115,7 @@ ARCHIVE CONTENTS
   nvme.readme            This file.
   diskboot.config.sample Example diskboot.config entry for
                          boot-drive use.
-  AutoInstall            Run from shell or double-click to install
+  Autoinstall            Run from shell or double-click to install
                          nvme.device into DEVS:.
 
 
@@ -125,8 +125,8 @@ INSTALLATION
 Standard install (runtime load from DEVS:):
 
   1. Extract the archive anywhere.
-  2. Double-click the `AutoInstall` icon, or from shell:
-         execute AutoInstall
+  2. Double-click the `Autoinstall` icon, or from shell:
+         execute Autoinstall
   3. nvme.device is now in DEVS:.
   4. Create a DOSDriver entry pointing at nvme.device in the usual
      way (Mountlist / DOSDrivers), or let partition auto-mount pick
