@@ -3,13 +3,29 @@
 Produces an AmigaOS 4.1 FE `Installation Utility` script (Python 2.5)
 that:
 
-  1. copies nvme.device into DEVS:   (runtime load -- the driver loads
-     on first OpenDevice() and namespaces auto-mount via
-     mounter.library; no reboot needed)
-  2. copies nvme_stats into C:
-  3. explains the OPTIONAL boot-drive (Kickstart module) steps on the
-     finish page -- those edits (Kicklayout + diskboot.config) are
-     deliberately left manual
+  1. asks where to install the driver -- a GUI choice page in the
+     style of the OS Update installers (U3's SDK page idiom: a
+     checkbox whose state an exithandler captures via GetUIAttr):
+
+       - unchecked (default): nvme.device -> DEVS:   (runtime load --
+         the driver loads on first OpenDevice() and namespaces
+         auto-mount via mounter.library; no reboot needed)
+       - checked: nvme.device -> SYS:Kickstart/  (boot-drive install;
+         the script also appends `MODULE Kickstart/nvme.device` to
+         SYS:Kickstart/Kicklayout with a Kicklayout.bak backup,
+         LF-only line endings, and idempotency)
+
+  2. copies nvme_stats into C: in both cases
+  3. explains the remaining manual boot-drive step (diskboot.config)
+     on the finish page, and offers an optional reboot (default off --
+     only the Kickstart install needs it)
+
+The destination choice is implemented exactly like the official
+AmigaOS 4.1 Update installers implement choices (GUI page + checkbox +
+packages registered dynamically inside the install page's
+entryhandler) -- the Installation Utility also offers AddRadioButton,
+but no shipping Hyperion installer uses it, so we stay on the
+field-proven DSL surface.
 
 install.py + NVMeInstallerLocale.py are emitted from this fixture by
 an in-house installer-script generator and committed, so building the
@@ -32,9 +48,11 @@ content/ paths, exactly like the OS's own update installers.
 """
 
 from installergen import (
-    Project, Page, PageKind, Package, PackageKind,
-    LocaleString, LocaleRef,
+    Project, Page, PageKind, Package, PackageKind, PostInstallAction,
+    LocaleString, LocaleRef, GuiBlock, GuiWidget, WidgetKind,
+    GroupOrientation,
 )
+from installergen.model import Handler
 
 
 locale = [
@@ -43,34 +61,106 @@ locale = [
         "\nWelcome to the installation of the NVMe device driver.\n\n"
         "nvme.device exposes NVMe SSDs on PCIe to AmigaOS 4.1 Final "
         "Edition as standard block devices that can be partitioned, "
-        "formatted, and mounted.\n\n"
+        "formatted, mounted -- and booted from.\n\n"
         "The following changes will be made to your system:\n\n"
-        "    1.  nvme.device will be copied to \"DEVS:\"\n\n"
+        "    1.  nvme.device will be copied to \"DEVS:\" or "
+        "\"SYS:Kickstart\" (your choice on the next page)\n\n"
         "    2.  the nvme_stats statistics monitor will be copied to "
-        "\"C:\"\n\n"
-        "No system restart is required: the driver loads on first "
-        "use and NVMe namespaces are mounted automatically.\n\n\n"
+        "\"C:\"\n\n\n"
         "Press \"Next\" to continue."),
+    LocaleString(
+        "MSG_DEST_INTRO",
+        "\nPlease choose where to install the driver.\n\n"
+        "Standard installation copies nvme.device to \"DEVS:\".  The "
+        "driver loads on first use and NVMe partitions are mounted "
+        "automatically.  No restart is required.  This is the right "
+        "choice for using NVMe disks as additional storage.\n\n"
+        "To BOOT AmigaOS from an NVMe disk, the driver must instead "
+        "load as a Kickstart module: nvme.device is then copied to "
+        "\"SYS:Kickstart\" and \"SYS:Kickstart/Kicklayout\" is updated "
+        "to load it during startup (the previous configuration is "
+        "preserved as \"Kicklayout.bak\").  One further manual step, "
+        "shown at the end of the installation, completes the "
+        "boot-drive setup."),
+    LocaleString(
+        "MSG_DEST_CHECKBOX",
+        "Install as a Kickstart module (boot from NVMe)"),
     LocaleString(
         "MSG_FINISH",
         "\nThe installation completed successfully.\n\n"
-        "nvme.device has been copied to \"DEVS:\" and nvme_stats to "
-        "\"C:\".  The driver loads on first use; NVMe namespaces are "
-        "discovered and mounted automatically.\n\n"
-        "OPTIONAL -- to BOOT from an NVMe disk, the driver must load "
-        "as a Kickstart module instead:\n\n"
-        "    1.  copy DEVS:nvme.device SYS:Kickstart/nvme.device\n\n"
-        "    2.  add this line to the Kicklayout in use:\n\n"
-        "            MODULE Kickstart/nvme.device\n\n"
-        "    3.  add this line to Kickstart/diskboot.config (see "
-        "diskboot.config.sample in this drawer):\n\n"
-        "            nvme.device 1 1\n\n"
-        "    4.  restart the system.\n\n"
-        "QEMU users: place nvme.device inside kickstart.zip's "
-        "Kickstart/ drawer instead -- see the project "
+        "nvme_stats has been copied to \"C:\".\n\n"
+        "If you chose the standard installation, nvme.device is now "
+        "in \"DEVS:\".  The driver loads on first use; NVMe "
+        "namespaces are discovered and mounted automatically.  No "
+        "restart is required.\n\n"
+        "If you chose the Kickstart module installation, nvme.device "
+        "is in \"SYS:Kickstart\" and \"SYS:Kickstart/Kicklayout\" has "
+        "been updated (backup: \"Kicklayout.bak\").  To complete the "
+        "boot-drive setup, add this line to "
+        "\"SYS:Kickstart/diskboot.config\" (see diskboot.config.sample "
+        "in this drawer), then restart:\n\n"
+        "    nvme.device 1 1\n\n"
+        "QEMU users booting via BBoot: place nvme.device, the "
+        "Kicklayout line, and the diskboot.config entry inside "
+        "kickstart.zip's Kickstart/ drawer instead -- see the project "
         "documentation.\n\n\n"
         "Press \"Finish\" to exit the installation."),
+    LocaleString(
+        "MSG_REBOOT",
+        "Restart the system now (only needed for the Kickstart module install)"),
 ]
+
+
+# Appends the MODULE line to Kicklayout, directly after the last
+# existing device-driver MODULE entry so the new driver loads alongside
+# the other disk drivers.  Pure Python 2.5; binary file modes keep the
+# LF-only line endings Kickstart loaders require.  Returns an error
+# string, or None on success (including the already-installed case).
+update_kicklayout = Handler(
+    name="updateKicklayout",
+    params=[],
+    body=(
+        "kl = \"SYS:Kickstart/Kicklayout\"\n"
+        "module_line = \"MODULE Kickstart/nvme.device\"\n"
+        "try:\n"
+        "    f = open(kl, \"rb\")\n"
+        "    data = f.read()\n"
+        "    f.close()\n"
+        "except IOError:\n"
+        "    return \"could not read \" + kl\n"
+        "lines = data.split(\"\\n\")\n"
+        "for ln in lines:\n"
+        "    if ln.strip() == module_line:\n"
+        "        return None        # already installed\n"
+        "last_dev = -1\n"
+        "last_mod = -1\n"
+        "for i in range(len(lines)):\n"
+        "    stripped = lines[i].strip()\n"
+        "    if stripped.startswith(\"MODULE\"):\n"
+        "        last_mod = i\n"
+        "        if stripped.find(\".device\") != -1:\n"
+        "            last_dev = i\n"
+        "insert_at = last_dev\n"
+        "if insert_at == -1:\n"
+        "    insert_at = last_mod\n"
+        "if insert_at == -1:\n"
+        "    return \"no MODULE lines found in \" + kl\n"
+        "out = lines[:insert_at + 1] + [module_line] + lines[insert_at + 1:]\n"
+        "try:\n"
+        "    b = open(kl + \".bak\", \"wb\")\n"
+        "    b.write(data)\n"
+        "    b.close()\n"
+        "except IOError:\n"
+        "    pass                   # backup is best-effort\n"
+        "try:\n"
+        "    f = open(kl, \"wb\")\n"
+        "    f.write(\"\\n\".join(out))\n"
+        "    f.close()\n"
+        "except IOError:\n"
+        "    return \"could not write \" + kl\n"
+        "return None\n"
+    ),
+)
 
 
 welcome_page = Page(
@@ -79,9 +169,98 @@ welcome_page = Page(
     strings={"message": LocaleRef("MSG_WELCOME")},
 )
 
+# Destination choice page -- official Update-installer idiom (U3 SDK
+# page): a GUI page with one checkbox; the exithandler captures its
+# state into a global that the install entryhandler acts on.
+destination_page = Page(
+    var_name="destChoicePage",
+    kind=PageKind.GUI,
+    exit_handler=Handler(
+        name="destChoiceExitHandler",
+        params=["page_nr", "direction"],
+        body=(
+            "global installKickstart\n"
+            "global KSCheckBoxID\n"
+            "installKickstart = GetUIAttr(page_nr, KSCheckBoxID, GUI_CHECKED)\n"
+            "return True\n"
+        ),
+    ),
+    gui=GuiBlock(
+        orientation=GroupOrientation.VERTICAL,
+        children=[
+            GuiWidget(kind=WidgetKind.LABEL,
+                      label=LocaleRef("MSG_DEST_INTRO")),
+            GuiBlock(
+                orientation=GroupOrientation.VERTICAL,
+                children=[
+                    GuiWidget(kind=WidgetKind.SPACE, weight=1),
+                    GuiWidget(
+                        kind=WidgetKind.CHECKBOX,
+                        label=LocaleRef("MSG_DEST_CHECKBOX"),
+                        checked=0,
+                        weight=0,
+                        capture_id_as="KSCheckBoxID",
+                    ),
+                    GuiWidget(kind=WidgetKind.SPACE, weight=1),
+                ],
+            ),
+            GuiWidget(kind=WidgetKind.SPACE),
+        ],
+    ),
+)
+
+# The driver package is registered dynamically so its destination
+# follows the choice; the Kicklayout edit runs on forward exit, only
+# for the Kickstart install.  Errors are reported via asl.MessageBox
+# with manual-fix instructions; the wizard still completes so the
+# copied driver isn't left half-installed silently.
 install_page = Page(
     var_name="installPage",
     kind=PageKind.INSTALL,
+    entry_handler=Handler(
+        name="installEntryHandler",
+        params=["page"],
+        body=(
+            "global installKickstart\n"
+            "\n"
+            "if installKickstart:\n"
+            "    driverPackage = AddPackage(FILEPACKAGE,\n"
+            "        name=\"NVMe device driver (Kickstart module)\",\n"
+            "        files=[\"content/nvme.device\"],\n"
+            "        alternatepath=\"SYS:Kickstart\"\n"
+            "        )\n"
+            "else:\n"
+            "    driverPackage = AddPackage(FILEPACKAGE,\n"
+            "        name=\"NVMe device driver\",\n"
+            "        files=[\"content/nvme.device\"],\n"
+            "        alternatepath=\"DEVS:\"\n"
+            "        )\n"
+        ),
+    ),
+    exit_handler=Handler(
+        name="installExitHandler",
+        params=["page_nr", "direction"],
+        body=(
+            "global installKickstart\n"
+            "if direction != 1:\n"
+            "    return True\n"
+            "if not installKickstart:\n"
+            "    return True\n"
+            "err = updateKicklayout()\n"
+            "if err:\n"
+            "    try:\n"
+            "        import asl\n"
+            "        asl.MessageBox(\"nvme.device installer\",\n"
+            "            \"Kicklayout update failed: \" + err + \"\\n\\n\"\n"
+            "            \"Please add this line to SYS:Kickstart/Kicklayout\\n\"\n"
+            "            \"manually, after the existing device driver lines:\\n\\n\"\n"
+            "            \"MODULE Kickstart/nvme.device\",\n"
+            "            \"OK\")\n"
+            "    except StandardError:\n"
+            "        pass\n"
+            "return True\n"
+        ),
+    ),
 )
 
 finish_page = Page(
@@ -91,23 +270,26 @@ finish_page = Page(
 )
 
 
-driver_package = Package(
-    name="NVMe device driver",
-    files=["content/nvme.device"],
-    kind=PackageKind.FILEPACKAGE,
-    # Fixed destinations: the runtime driver belongs in DEVS: and the
-    # CLI tool in C: regardless of any user preference, so there is no
-    # DESTINATION page.  Emitted verbatim, hence the embedded quotes.
-    alternatepath="\"DEVS:\"",
-    register_in="top",
-)
-
 stats_package = Package(
     name="nvme_stats statistics monitor",
     files=["content/nvme_stats"],
     kind=PackageKind.FILEPACKAGE,
+    # Fixed destination: the CLI tool belongs in C: regardless of the
+    # driver-destination choice.  Emitted verbatim, hence the quotes.
     alternatepath="\"C:\"",
     register_in="top",
+)
+
+reboot_action = PostInstallAction(
+    name="Reboot",
+    description=LocaleRef("MSG_REBOOT"),
+    visible=True,
+    default=False,
+    callback=Handler(
+        name="rebootHandler",
+        params=[],
+        body="amiga.system(\"reboot SYNC\")\nreturn True\n",
+    ),
 )
 
 
@@ -117,6 +299,12 @@ project = Project(
     version="1.68",
     date="11.06.2026",
     locale_strings=locale,
-    pages=[welcome_page, install_page, finish_page],
-    packages=[driver_package, stats_package],
+    preamble=[
+        "installKickstart = 0",
+        "KSCheckBoxID = None",
+    ],
+    helpers=[update_kicklayout],
+    pages=[welcome_page, destination_page, install_page, finish_page],
+    packages=[stats_package],
+    post_install_actions=[reboot_action],
 )
