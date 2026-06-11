@@ -230,7 +230,6 @@ tests/
 docs/
   architecture.md       Architecture and protocol reference
   nvme_boot_strategy.md Booting AmigaOS with/from NVMe under QEMU
-  modernization_plan.md Development plan (historical)
   history.md            Detailed development changelog
 ```
 

@@ -1,6 +1,30 @@
 build/
+deploy/
 *.o
 *.device
 *.lha
 *.tar.gz
 tmp/
+temp/
+
+# Local IDE / editor / agent state (machine-specific or session-local)
+.clangd
+.claude/
+
+# AI agent instruction / context files -- local only, not published
+CLAUDE.md
+CLAUDE.local.md
+AGENTS.md
+GEMINI.md
+.cursorrules
+.cursor/
+.windsurfrules
+.aider*
+.github/copilot-instructions.md
+
+# Internal planning / design documents -- not part of the published repo
+PLAN.md
+PROGRESS.md
+docs/PLAN*.md
+docs/*_plan.md
+docs/modernization_plan.md
