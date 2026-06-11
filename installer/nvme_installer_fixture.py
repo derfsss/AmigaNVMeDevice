@@ -71,39 +71,27 @@ locale = [
     LocaleString(
         "MSG_DEST_INTRO",
         "\nPlease choose where to install the driver.\n\n"
-        "Standard installation copies nvme.device to \"DEVS:\".  The "
-        "driver loads on first use and NVMe partitions are mounted "
-        "automatically.  No restart is required.  This is the right "
-        "choice for using NVMe disks as additional storage.\n\n"
-        "To BOOT AmigaOS from an NVMe disk, the driver must instead "
-        "load as a Kickstart module: nvme.device is then copied to "
-        "\"SYS:Kickstart\" and \"SYS:Kickstart/Kicklayout\" is updated "
-        "to load it during startup (the previous configuration is "
-        "preserved as \"Kicklayout.bak\").  One further manual step, "
-        "shown at the end of the installation, completes the "
-        "boot-drive setup."),
+        "Standard installation (to \"DEVS:\"): the driver loads on "
+        "first use and NVMe partitions mount automatically.  No "
+        "restart is needed.\n\n"
+        "Kickstart module (to \"SYS:Kickstart\"): choose this to BOOT "
+        "from an NVMe disk.  Kicklayout is updated automatically "
+        "(backup: \"Kicklayout.bak\"); see nvme.readme for details."),
     LocaleString(
         "MSG_DEST_CHECKBOX",
         "Install as a Kickstart module (boot from NVMe)"),
     LocaleString(
         "MSG_FINISH",
-        "\nThe installation completed successfully.\n\n"
-        "nvme_stats has been copied to \"C:\".\n\n"
-        "If you chose the standard installation, nvme.device is now "
-        "in \"DEVS:\".  The driver loads on first use; NVMe "
-        "namespaces are discovered and mounted automatically.  No "
-        "restart is required.\n\n"
-        "If you chose the Kickstart module installation, nvme.device "
-        "is in \"SYS:Kickstart\" and \"SYS:Kickstart/Kicklayout\" has "
-        "been updated (backup: \"Kicklayout.bak\").  To complete the "
-        "boot-drive setup, add this line to "
+        "\nThe installation has finished.\n\n"
+        "nvme.device and the nvme_stats tool are now installed.  With "
+        "the standard installation no restart is needed: the driver "
+        "loads on first use and NVMe partitions mount "
+        "automatically.\n\n"
+        "If you chose the Kickstart module installation, one manual "
+        "step remains: add the line \"nvme.device 1 1\" to "
         "\"SYS:Kickstart/diskboot.config\" (see diskboot.config.sample "
-        "in this drawer), then restart:\n\n"
-        "    nvme.device 1 1\n\n"
-        "QEMU users booting via BBoot: place nvme.device, the "
-        "Kicklayout line, and the diskboot.config entry inside "
-        "kickstart.zip's Kickstart/ drawer instead -- see the project "
-        "documentation.\n\n\n"
+        "in this drawer), then restart.  Full details, including QEMU "
+        "BBoot setups, are in the nvme.readme file.\n\n\n"
         "Press \"Finish\" to exit the installation."),
     LocaleString(
         "MSG_REBOOT",
