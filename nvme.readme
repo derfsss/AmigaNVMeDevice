@@ -14,22 +14,22 @@ for NVMe controllers on PCIe.  It exposes NVMe namespaces as standard
 AmigaOS units that can be partitioned, mounted, and booted from just
 like any trackdisk-compatible device.
 
-One binary runs on every AmigaOS 4.1 FE platform whose PCIe bridge
-forwards CPU memory cycles:
+Validated under QEMU on the pegasos2, sam460ex, and amigaone
+machines (the emulator attaches the NVMe controller to the emulated
+PCI bus, so all three work there).
 
-  * Pegasos II       (MV64361 bridge)
-  * Sam440ep         (AMCC 440EP)
-  * Sam460ex         (AMCC 460EX)
-  * X1000            (PA6T Nemo)
-  * X5000            (QorIQ P5020 / P5040)
-  * A1222 "Tabor"    (QorIQ P1022)
-  * AmigaOne 500
-  * QEMU Pegasos2    (default test target)
+On REAL hardware an NVMe drive needs a free PCIe slot (via an M.2
+adapter card), which only two AmigaOS 4.1 machines have:
 
-The original AmigaOne XE / SE (Mai Logic Articia S) is NOT supported
-because that bridge does not forward CPU memory cycles to PCIe MMIO.
-The driver detects this at init time and aborts cleanly with a
-diagnostic message.
+  * X1000            (PA6T Nemo)      - expected to work, awaiting
+                                        confirmation
+  * X5000            (QorIQ P5020/40) - expected to work, awaiting
+                                        confirmation
+
+The other machines (Pegasos II, Sam440ep, Sam460ex, A1222,
+AmigaOne XE/SE) have no available PCIe slot for an NVMe drive --
+PCI/AGP only, or the PCIe lanes are already occupied -- so the
+driver has nothing to find there; it declines to load cleanly.
 
 Validated end-to-end on QEMU Pegasos2:
   - Boots to DOS / Workbench

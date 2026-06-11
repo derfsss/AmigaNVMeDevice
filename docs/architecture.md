@@ -12,13 +12,14 @@ system disk drivers for boot-drive compatibility).  Multi-controller, up to
 4 × 8-namespace each (32 flat units).  All NVMe I/O is available immediately
 at boot.
 
-Canonical status / roadmap: `docs/modernization_plan.md`.
+Canonical changelog: `docs/history.md`.
 
 ---
 
 ## Hardware Target
 
-Supported platforms (single binary, runtime-detected):
+Host bridges recognised by the platform-detection table (diagnostic —
+the BAR0 MMIO probe is the authoritative gate):
 
 | Platform        | Host bridge           |
 |-----------------|-----------------------|
@@ -30,6 +31,14 @@ Supported platforms (single binary, runtime-detected):
 | X5000           | NXP QorIQ P5020/P5040 |
 | A1222 "Tabor"   | NXP QorIQ P1022       |
 | AmigaOne 500    | -                     |
+
+**Practical real-hardware targets are the X1000 and X5000 only** — an
+NVMe drive needs a free PCIe slot (via an M.2 adapter card), and the
+other machines have none available (PCI/AGP only, or PCIe lanes
+already occupied).  On those, the class-code scan simply finds no
+controller and the driver declines to load.  Under QEMU all tested
+machines (pegasos2, sam460ex, amigaone) work, since the emulator
+attaches the NVMe controller to the emulated PCI bus.
 
 **Not supported**: AmigaOne XE/SE (Mai Logic Articia S) — the bridge does
 not forward CPU memory cycles to PCIe.  The driver detects this via the

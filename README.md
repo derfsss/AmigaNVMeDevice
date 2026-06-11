@@ -2,7 +2,7 @@
 
 A native AmigaOS 4.1 Final Edition block-device driver for NVMe SSDs on PCIe — partition, format, mount, and boot from NVMe namespaces.
 
-**Status:** Beta (v1.68) — validated end-to-end under QEMU (Pegasos2, SAM460ex, AmigaOne, including boot-from-NVMe); real-hardware confirmation pending.
+**Status:** Beta (v1.68) — validated end-to-end under QEMU (Pegasos2, SAM460ex, AmigaOne, including boot-from-NVMe); real-hardware confirmation pending on the X1000 and X5000, the only models with a free PCIe slot for an NVMe drive.
 
 > ⚠️ **Beta — actively under development.** Expect bugs and rough
 > edges; do not rely on it for anything important. Use at your own
@@ -31,15 +31,13 @@ cleanly and the system boots normally.
 | QEMU Pegasos2 | Marvell MV64361 | Tested end-to-end, boots from NVMe |
 | QEMU SAM460ex | AMCC 460EX | Tested end-to-end |
 | QEMU AmigaOne | Mai Logic Articia S (emulated) | Tested end-to-end (driver repairs the OS's half-programmed 64-bit BAR) |
-| Pegasos II | Marvell MV64361 | Expected to work (same bridge as QEMU) |
-| Sam440ep / Sam460ex | AMCC 440EP / 460EX | Expected to work |
-| AmigaOne X1000 | PA6T "Nemo" | Expected to work |
-| AmigaOne X5000 | QorIQ P5020/P5040 | Expected to work |
-| A1222 "Tabor" | QorIQ P1022 | Expected to work |
-| AmigaOne XE / SE (real hardware) | Mai Logic Articia S | **Not expected to work** — real Articia silicon does not forward MMIO reliably; the driver detects this at the probe and aborts init cleanly |
+| AmigaOne X1000 | PA6T "Nemo" | Expected to work — has a free PCIe slot for an NVMe adapter card; awaiting confirmation |
+| AmigaOne X5000 | QorIQ P5020/P5040 | Expected to work — has a free PCIe slot for an NVMe adapter card; awaiting confirmation |
+| Other real machines (Pegasos II, Sam440ep, Sam460ex, A1222, AmigaOne XE/SE) | various | **Not applicable** — no available PCIe slot for an NVMe drive (PCI/AGP only, or the PCIe lanes are already occupied), so the driver has nothing to find; it declines to load cleanly |
 
-"Expected to work" platforms use the same runtime-detected code paths
-validated under QEMU; they await confirmation on real hardware.
+The X1000/X5000 use the same runtime-detected code paths validated
+under QEMU; they await confirmation on real hardware (an NVMe SSD in
+a PCIe M.2 adapter card).
 
 ---
 
