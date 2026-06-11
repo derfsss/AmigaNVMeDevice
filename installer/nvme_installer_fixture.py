@@ -3,36 +3,29 @@
 Produces an AmigaOS 4.1 FE `Installation Utility` script (Python 2.5)
 that:
 
-  1. asks where to install the driver -- a GUI choice page with a
-     mutually-exclusive radio (MX) gadget; the first option is
-     selected by default:
+  1. asks where to install the driver -- a mutually-exclusive radio
+     (MX) gadget; the first option is selected by default:
 
        - "Standard installation (DEVS:)"  [default]: runtime load --
          the driver loads on first OpenDevice() and namespaces
          auto-mount via mounter.library; no reboot needed
        - "Kickstart module (boot from NVMe)": nvme.device goes to
-         SYS:Kickstart/ and the script appends
-         `MODULE Kickstart/nvme.device` to SYS:Kickstart/Kicklayout
-         (Kicklayout.bak backup, LF-only line endings, idempotent)
+         SYS:Kickstart/ and `MODULE Kickstart/nvme.device` is appended
+         to SYS:Kickstart/Kicklayout (Kicklayout.bak backup, LF-only
+         line endings, idempotent)
 
   2. copies nvme_stats into C: in both cases
   3. explains the remaining manual boot-drive step (diskboot.config)
      on the finish page, and offers an optional reboot (default off --
      only the Kickstart install needs it)
 
-The exithandler captures the radio selection via
-GetUIAttr(..., GUI_SELECTED) and the install page's entryhandler
-registers the driver package with the matching destination -- the
-dynamic-package half is the official U3 installer idiom.
-AddRadioButton itself is not used by any shipping Hyperion installer
-but is a verified part of the Installation Utility API ("Add a
-Radiobutton (MX) gadget", probed live on Utility 53.18).
-
 install.py + NVMeInstallerLocale.py are emitted from this fixture by
 an in-house installer-script generator and committed, so building the
 distribution archive needs no extra tooling.  This fixture is the
 authoritative description of the installer's pages, messages, and
-behaviour.
+behaviour.  The page idioms and the Kicklayout edit are expanded from
+`installergen.presets` -- the field-tested templates shared by all of
+this author's driver installers.
 
 Archive layout consumed by the script (see `make dist`):
 
@@ -50,12 +43,20 @@ content/ paths, exactly like the OS's own update installers.
 
 from installergen import (
     Project, Page, PageKind, Package, PackageKind, PostInstallAction,
-    LocaleString, LocaleRef, GuiBlock, GuiWidget, WidgetKind,
-    GroupOrientation, Frame, LabelAlign,
+    LocaleString, LocaleRef, Handler,
 )
-from installergen.model import Handler
+from installergen.presets import (
+    README_BUTTON_LOCALE, InsertAfterLast, welcome_with_readme,
+    destination_choice, finish_page, system_edit_helper,
+    system_edit_exit_handler,
+)
 
 
+# NOTE: the Installation Utility's page text is PLAIN TEXT only and the
+# label does NOT scroll -- keep pages inside the ~20-rendered-line lint
+# budget and defer detail to the bundled readme.  Formatting follows
+# Hyperion's own Update installers: leading blank line, paragraph
+# spacing, quoted file and button names, explicit navigation cue.
 locale = [
     LocaleString(
         "MSG_WELCOME",
@@ -71,9 +72,7 @@ locale = [
         "Click \"View Readme\" below for manual installation details "
         "and general instructions on use.\n\n\n"
         "Press \"Next\" to continue."),
-    LocaleString(
-        "MSG_README_BUTTON",
-        "View Readme..."),
+    README_BUTTON_LOCALE,
     LocaleString(
         "MSG_DEST_INTRO",
         "\nPlease choose where to install the driver.\n\n"
@@ -108,147 +107,28 @@ locale = [
 ]
 
 
-# Appends the MODULE line to Kicklayout, directly after the last
-# existing device-driver MODULE entry so the new driver loads alongside
-# the other disk drivers.  Pure Python 2.5; binary file modes keep the
-# LF-only line endings Kickstart loaders require.  Returns an error
-# string, or None on success (including the already-installed case).
-update_kicklayout = Handler(
-    name="updateKicklayout",
-    params=[],
-    body=(
-        "kl = \"SYS:Kickstart/Kicklayout\"\n"
-        "module_line = \"MODULE Kickstart/nvme.device\"\n"
-        "try:\n"
-        "    f = open(kl, \"rb\")\n"
-        "    data = f.read()\n"
-        "    f.close()\n"
-        "except IOError:\n"
-        "    return \"could not read \" + kl\n"
-        "lines = data.split(\"\\n\")\n"
-        "for ln in lines:\n"
-        "    if ln.strip() == module_line:\n"
-        "        return None        # already installed\n"
-        "last_dev = -1\n"
-        "last_mod = -1\n"
-        "for i in range(len(lines)):\n"
-        "    stripped = lines[i].strip()\n"
-        "    if stripped.startswith(\"MODULE\"):\n"
-        "        last_mod = i\n"
-        "        if stripped.find(\".device\") != -1:\n"
-        "            last_dev = i\n"
-        "insert_at = last_dev\n"
-        "if insert_at == -1:\n"
-        "    insert_at = last_mod\n"
-        "if insert_at == -1:\n"
-        "    return \"no MODULE lines found in \" + kl\n"
-        "out = lines[:insert_at + 1] + [module_line] + lines[insert_at + 1:]\n"
-        "try:\n"
-        "    b = open(kl + \".bak\", \"wb\")\n"
-        "    b.write(data)\n"
-        "    b.close()\n"
-        "except IOError:\n"
-        "    pass                   # backup is best-effort\n"
-        "try:\n"
-        "    f = open(kl, \"wb\")\n"
-        "    f.write(\"\\n\".join(out))\n"
-        "    f.close()\n"
-        "except IOError:\n"
-        "    return \"could not write \" + kl\n"
-        "return None\n"
-    ),
+# Welcome page with the View Readme button (proven preset).
+welcome_page = welcome_with_readme(LocaleRef("MSG_WELCOME"), "nvme.readme")
+
+# Destination choice page (proven preset): radio gadget, DEVS: default,
+# selected index captured into the installKickstart global.
+dest_page, dest_preamble = destination_choice(
+    intro=LocaleRef("MSG_DEST_INTRO"),
+    choices=[LocaleRef("MSG_DEST_OPT_DEVS"),
+             LocaleRef("MSG_DEST_OPT_KICKSTART")],
+    capture_global="installKickstart",
 )
 
-
-# Welcome page is a GUI page (same rendered look as WELCOME) so it can
-# carry a "View Readme" button -- U2's kicklayout-page button idiom:
-# AddButton onclick handler launching NotePad on the bundled readme.
-welcome_page = Page(
-    var_name="welcomePage",
-    kind=PageKind.GUI,
-    on_click_handlers=[
-        Handler(
-            name="readmeLaunch",
-            params=["page", "id"],
-            body=(
-                "amiga.system('notepad *>NIL: \"nvme.readme\"')\n"
-                "return True\n"
-            ),
-        ),
-    ],
-    gui=GuiBlock(
-        orientation=GroupOrientation.VERTICAL,
-        children=[
-            GuiWidget(kind=WidgetKind.LABEL,
-                      label=LocaleRef("MSG_WELCOME"),
-                      weight=6, align=LabelAlign.LEFT),
-            GuiBlock(
-                orientation=GroupOrientation.HORIZONTAL,
-                weight=0,
-                children=[
-                    GuiWidget(kind=WidgetKind.SPACE, weight=1),
-                    GuiWidget(
-                        kind=WidgetKind.BUTTON,
-                        frame=Frame.BUTTON,
-                        label=LocaleRef("MSG_README_BUTTON"),
-                        onclick="readmeLaunch",
-                        weight=10,
-                    ),
-                    GuiWidget(kind=WidgetKind.SPACE, weight=1),
-                ],
-            ),
-            GuiWidget(kind=WidgetKind.SPACE, weight=1),
-        ],
-    ),
-)
-
-# Destination choice page -- a mutually-exclusive radio (MX) gadget;
-# the first choice (DEVS:) is selected by default and selecting one
-# option deselects the other.  The exithandler captures the selected
-# index into a global that the install entryhandler acts on.
-destination_page = Page(
-    var_name="destChoicePage",
-    kind=PageKind.GUI,
-    exit_handler=Handler(
-        name="destChoiceExitHandler",
-        params=["page_nr", "direction"],
-        body=(
-            "global installKickstart\n"
-            "global DestRadioID\n"
-            "installKickstart = GetUIAttr(page_nr, DestRadioID, GUI_SELECTED)\n"
-            "return True\n"
-        ),
-    ),
-    gui=GuiBlock(
-        orientation=GroupOrientation.VERTICAL,
-        children=[
-            GuiWidget(kind=WidgetKind.LABEL,
-                      label=LocaleRef("MSG_DEST_INTRO"),
-                      weight=6, align=LabelAlign.LEFT),
-            GuiBlock(
-                orientation=GroupOrientation.VERTICAL,
-                children=[
-                    GuiWidget(kind=WidgetKind.SPACE, weight=1),
-                    GuiWidget(
-                        kind=WidgetKind.RADIO,
-                        choices=[LocaleRef("MSG_DEST_OPT_DEVS"),
-                                 LocaleRef("MSG_DEST_OPT_KICKSTART")],
-                        weight=0,
-                        capture_id_as="DestRadioID",
-                    ),
-                    GuiWidget(kind=WidgetKind.SPACE, weight=1),
-                ],
-            ),
-            GuiWidget(kind=WidgetKind.SPACE, weight=1),
-        ],
-    ),
+# Kicklayout edit (proven preset), run only for the Kickstart install.
+update_kicklayout = system_edit_helper(
+    "SYS:Kickstart/Kicklayout",
+    "MODULE Kickstart/nvme.device",
+    InsertAfterLast(contains=".device"),
 )
 
 # The driver package is registered dynamically so its destination
-# follows the choice; the Kicklayout edit runs on forward exit, only
-# for the Kickstart install.  Errors are reported via asl.MessageBox
-# with manual-fix instructions; the wizard still completes so the
-# copied driver isn't left half-installed silently.
+# follows the choice; the Kicklayout edit runs on forward exit, gated
+# on the Kickstart selection.
 install_page = Page(
     var_name="installPage",
     kind=PageKind.INSTALL,
@@ -272,37 +152,16 @@ install_page = Page(
             "        )\n"
         ),
     ),
-    exit_handler=Handler(
-        name="installExitHandler",
-        params=["page_nr", "direction"],
-        body=(
-            "global installKickstart\n"
-            "if direction != 1:\n"
-            "    return True\n"
-            "if not installKickstart:\n"
-            "    return True\n"
-            "err = updateKicklayout()\n"
-            "if err:\n"
-            "    try:\n"
-            "        import asl\n"
-            "        asl.MessageBox(\"nvme.device installer\",\n"
-            "            \"Kicklayout update failed: \" + err + \"\\n\\n\"\n"
-            "            \"Please add this line to SYS:Kickstart/Kicklayout\\n\"\n"
-            "            \"manually, after the existing device driver lines:\\n\\n\"\n"
-            "            \"MODULE Kickstart/nvme.device\",\n"
-            "            \"OK\")\n"
-            "    except StandardError:\n"
-            "        pass\n"
-            "return True\n"
-        ),
+    exit_handler=system_edit_exit_handler(
+        "SYS:Kickstart/Kicklayout",
+        "MODULE Kickstart/nvme.device",
+        "nvme.device installer",
+        "manually, after the existing device driver lines:",
+        gate_global="installKickstart",
     ),
 )
 
-finish_page = Page(
-    var_name="finishPage",
-    kind=PageKind.FINISH,
-    strings={"message": LocaleRef("MSG_FINISH")},
-)
+finish = finish_page(LocaleRef("MSG_FINISH"))
 
 
 stats_package = Package(
@@ -334,12 +193,9 @@ project = Project(
     version="1.68",
     date="11.06.2026",
     locale_strings=locale,
-    preamble=[
-        "installKickstart = 0",
-        "DestRadioID = None",
-    ],
+    preamble=dest_preamble,
     helpers=[update_kicklayout],
-    pages=[welcome_page, destination_page, install_page, finish_page],
+    pages=[welcome_page, dest_page, install_page, finish],
     packages=[stats_package],
     post_install_actions=[reboot_action],
 )
