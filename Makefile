@@ -166,9 +166,9 @@ deploy-debug: $(DBG_TARGET) $(DBG_TEST) $(DBG_STATS)
 # double-click with the drawer as current directory.  drawer.info
 # becomes the archive-root drawer icon.
 #
-# `make dist-lha` wraps the staging directory + a copy of the readme at
-# the archive root into an LHA.  Uses host lha when available, otherwise
-# runs lha inside the toolchain Docker image.
+# `make dist-lha` packs the staged drawer + its drawer icon into an
+# LHA.  Uses host lha when available, otherwise runs lha inside the
+# toolchain Docker image.
 dist: release debug nvme.readme diskboot.config.sample
 	@echo "=== Staging distribution tree in $(DIST_DIR) ==="
 	@rm -rf $(DIST_STAGE)
@@ -183,7 +183,7 @@ dist: release debug nvme.readme diskboot.config.sample
 	cp -f installer/drawer.info            $(DIST_DIR)/$(DIST_NAME).info
 	cp -f nvme.readme               $(DIST_STAGE)/nvme.readme
 	cp -f diskboot.config.sample    $(DIST_STAGE)/diskboot.config.sample
-	cp -f nvme.readme               $(DIST_DIR)/nvme.readme
+	@rm -f $(DIST_DIR)/nvme.readme
 	@echo ""
 	@echo "Staged contents:"
 	@find $(DIST_STAGE) $(DIST_DIR)/$(DIST_NAME).info -type f | sort
@@ -194,11 +194,11 @@ dist-lha: dist
 	@echo "=== Packing $(DIST_LHA) ==="
 	@rm -f $(DIST_LHA)
 	@if command -v lha >/dev/null 2>&1; then \
-	    (cd $(DIST_DIR) && lha ao5q ../../$(DIST_LHA) $(DIST_NAME) $(DIST_NAME).info nvme.readme); \
+	    (cd $(DIST_DIR) && lha ao5q ../../$(DIST_LHA) $(DIST_NAME) $(DIST_NAME).info); \
 	else \
 	    echo "lha not on PATH — packing inside Docker"; \
 	    docker run --rm -v "$(CURDIR):/work" -w /work/$(DIST_DIR) $(DOCKER_IMAGE) \
-	        sh -c 'lha ao5q /work/$(DIST_LHA) $(DIST_NAME) $(DIST_NAME).info nvme.readme'; \
+	        sh -c 'lha ao5q /work/$(DIST_LHA) $(DIST_NAME) $(DIST_NAME).info'; \
 	fi
 	@ls -la $(DIST_LHA)
 
