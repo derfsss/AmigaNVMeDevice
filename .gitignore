@@ -28,3 +28,5 @@ PROGRESS.md
 docs/PLAN*.md
 docs/*_plan.md
 docs/modernization_plan.md
+__pycache__/
+*.pyc

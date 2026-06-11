@@ -97,7 +97,9 @@ FEATURES
 ARCHIVE CONTENTS
 ================
 
-  nvme.device            Release build — use this as your driver.
+  content/nvme.device    Release build — installed by install.py.
+  content/nvme_stats     CLI statistics monitor — installed by
+                         install.py (see below for usage).
   nvme.device.debug      Debug build — identical behaviour, full
                          verbose serial-console trace.  Rename to
                          nvme.device to swap it in for debugging.
@@ -106,8 +108,7 @@ ARCHIVE CONTENTS
                          round-trip verify, TD_READ64 at a high
                          offset, a 6 MiB transfer through the
                          chunking path, and misalignment rejection.
-  nvme_stats             CLI monitor for the live statistics
-                         interface.  Usage:
+                         nvme_stats usage:
                            nvme_stats                one unit 0 snap
                            nvme_stats 1              unit 1 snap
                            nvme_stats -w 0 1         watch unit 0 1s
@@ -115,8 +116,10 @@ ARCHIVE CONTENTS
   nvme.readme            This file.
   diskboot.config.sample Example diskboot.config entry for
                          boot-drive use.
-  Autoinstall            Run from shell or double-click to install
-                         nvme.device into DEVS:.
+  install.py             AmigaOS Installation Utility wizard --
+                         double-click its icon to install
+                         nvme.device into DEVS: and nvme_stats
+                         into C:.
 
 
 INSTALLATION
@@ -125,12 +128,13 @@ INSTALLATION
 Standard install (runtime load from DEVS:):
 
   1. Extract the archive anywhere.
-  2. Double-click the `Autoinstall` icon, or from shell:
-         execute Autoinstall
-  3. nvme.device is now in DEVS:.
-  4. Create a DOSDriver entry pointing at nvme.device in the usual
-     way (Mountlist / DOSDrivers), or let partition auto-mount pick
-     it up via mounter.library.
+  2. Double-click the `install.py` icon -- the AmigaOS Installation
+     Utility wizard performs the installation.  From a shell (with
+     the drawer as current directory):
+         "SYS:Utilities/Installation Utility" PACKAGE=install.py
+  3. nvme.device is now in DEVS: and nvme_stats in C:.
+  4. The driver loads on first use; partitions auto-mount via
+     mounter.library.
 
 
 Boot-drive install (Kickstart module):
