@@ -12,7 +12,7 @@ import os
 loc = NVMeInstallerLocale()
 
 installKickstart = 0
-KSCheckBoxID = None
+DestRadioID = None
 
 def updateKicklayout():
     kl = "SYS:Kickstart/Kicklayout"
@@ -66,8 +66,8 @@ destChoicePage = NewPage(GUI)
 
 def destChoiceExitHandler(page_nr, direction):
     global installKickstart
-    global KSCheckBoxID
-    installKickstart = GetUIAttr(page_nr, KSCheckBoxID, GUI_CHECKED)
+    global DestRadioID
+    installKickstart = GetUIAttr(page_nr, DestRadioID, GUI_SELECTED)
     return True
 SetObject(destChoicePage, "exithandler", destChoiceExitHandler)
 
@@ -76,7 +76,7 @@ BeginGroup(GROUP_VERTICAL)
 AddLabel(label=loc.GetString(loc.MSG_DEST_INTRO))
 BeginGroup(GROUP_VERTICAL)
 AddSpace(weight=1)
-KSCheckBoxID = AddCheckBox(label=loc.GetString(loc.MSG_DEST_CHECKBOX), checked=0, weight=0)
+DestRadioID = AddRadioButton(choices=[loc.GetString(loc.MSG_DEST_OPT_DEVS), loc.GetString(loc.MSG_DEST_OPT_KICKSTART)], weight=0)
 AddSpace(weight=1)
 EndGroup()
 AddSpace()

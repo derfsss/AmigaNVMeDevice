@@ -3,29 +3,30 @@
 Produces an AmigaOS 4.1 FE `Installation Utility` script (Python 2.5)
 that:
 
-  1. asks where to install the driver -- a GUI choice page in the
-     style of the OS Update installers (U3's SDK page idiom: a
-     checkbox whose state an exithandler captures via GetUIAttr):
+  1. asks where to install the driver -- a GUI choice page with a
+     mutually-exclusive radio (MX) gadget; the first option is
+     selected by default:
 
-       - unchecked (default): nvme.device -> DEVS:   (runtime load --
+       - "Standard installation (DEVS:)"  [default]: runtime load --
          the driver loads on first OpenDevice() and namespaces
-         auto-mount via mounter.library; no reboot needed)
-       - checked: nvme.device -> SYS:Kickstart/  (boot-drive install;
-         the script also appends `MODULE Kickstart/nvme.device` to
-         SYS:Kickstart/Kicklayout with a Kicklayout.bak backup,
-         LF-only line endings, and idempotency)
+         auto-mount via mounter.library; no reboot needed
+       - "Kickstart module (boot from NVMe)": nvme.device goes to
+         SYS:Kickstart/ and the script appends
+         `MODULE Kickstart/nvme.device` to SYS:Kickstart/Kicklayout
+         (Kicklayout.bak backup, LF-only line endings, idempotent)
 
   2. copies nvme_stats into C: in both cases
   3. explains the remaining manual boot-drive step (diskboot.config)
      on the finish page, and offers an optional reboot (default off --
      only the Kickstart install needs it)
 
-The destination choice is implemented exactly like the official
-AmigaOS 4.1 Update installers implement choices (GUI page + checkbox +
-packages registered dynamically inside the install page's
-entryhandler) -- the Installation Utility also offers AddRadioButton,
-but no shipping Hyperion installer uses it, so we stay on the
-field-proven DSL surface.
+The exithandler captures the radio selection via
+GetUIAttr(..., GUI_SELECTED) and the install page's entryhandler
+registers the driver package with the matching destination -- the
+dynamic-package half is the official U3 installer idiom.
+AddRadioButton itself is not used by any shipping Hyperion installer
+but is a verified part of the Installation Utility API ("Add a
+Radiobutton (MX) gadget", probed live on Utility 53.18).
 
 install.py + NVMeInstallerLocale.py are emitted from this fixture by
 an in-house installer-script generator and committed, so building the
@@ -78,8 +79,11 @@ locale = [
         "from an NVMe disk.  Kicklayout is updated automatically "
         "(backup: \"Kicklayout.bak\"); see nvme.readme for details."),
     LocaleString(
-        "MSG_DEST_CHECKBOX",
-        "Install as a Kickstart module (boot from NVMe)"),
+        "MSG_DEST_OPT_DEVS",
+        "Standard installation (DEVS:)"),
+    LocaleString(
+        "MSG_DEST_OPT_KICKSTART",
+        "Kickstart module (boot from NVMe)"),
     LocaleString(
         "MSG_FINISH",
         "\nThe installation has finished.\n\n"
@@ -157,9 +161,10 @@ welcome_page = Page(
     strings={"message": LocaleRef("MSG_WELCOME")},
 )
 
-# Destination choice page -- official Update-installer idiom (U3 SDK
-# page): a GUI page with one checkbox; the exithandler captures its
-# state into a global that the install entryhandler acts on.
+# Destination choice page -- a mutually-exclusive radio (MX) gadget;
+# the first choice (DEVS:) is selected by default and selecting one
+# option deselects the other.  The exithandler captures the selected
+# index into a global that the install entryhandler acts on.
 destination_page = Page(
     var_name="destChoicePage",
     kind=PageKind.GUI,
@@ -168,8 +173,8 @@ destination_page = Page(
         params=["page_nr", "direction"],
         body=(
             "global installKickstart\n"
-            "global KSCheckBoxID\n"
-            "installKickstart = GetUIAttr(page_nr, KSCheckBoxID, GUI_CHECKED)\n"
+            "global DestRadioID\n"
+            "installKickstart = GetUIAttr(page_nr, DestRadioID, GUI_SELECTED)\n"
             "return True\n"
         ),
     ),
@@ -183,11 +188,11 @@ destination_page = Page(
                 children=[
                     GuiWidget(kind=WidgetKind.SPACE, weight=1),
                     GuiWidget(
-                        kind=WidgetKind.CHECKBOX,
-                        label=LocaleRef("MSG_DEST_CHECKBOX"),
-                        checked=0,
+                        kind=WidgetKind.RADIO,
+                        choices=[LocaleRef("MSG_DEST_OPT_DEVS"),
+                                 LocaleRef("MSG_DEST_OPT_KICKSTART")],
                         weight=0,
-                        capture_id_as="KSCheckBoxID",
+                        capture_id_as="DestRadioID",
                     ),
                     GuiWidget(kind=WidgetKind.SPACE, weight=1),
                 ],
@@ -289,7 +294,7 @@ project = Project(
     locale_strings=locale,
     preamble=[
         "installKickstart = 0",
-        "KSCheckBoxID = None",
+        "DestRadioID = None",
     ],
     helpers=[update_kicklayout],
     pages=[welcome_page, destination_page, install_page, finish_page],
